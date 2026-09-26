@@ -1,3 +1,4 @@
+require('./utils/preferIpv4Dns');
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -17,6 +18,12 @@ function createApp() {
   const { applyVendorLock } = require('./services/aiConfigService');
   applyVendorLock(db, logger, config);
   const log = logger;
+
+  const taskService = require('./services/taskService');
+  taskService.failOrphanedAsyncTasksOnStartup(db, log);
+
+  const { resumeProcessingVideoGenerations } = require('./services/videoService');
+  resumeProcessingVideoGenerations(db, log);
 
   const app = express();
   app.use(express.json({ limit: '10mb' }));

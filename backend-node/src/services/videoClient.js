@@ -4,6 +4,13 @@ const path = require('path');
 const aiConfigService = require('./aiConfigService');
 let sharp; try { sharp = require('sharp'); } catch (_) { sharp = null; }
 const { uploadLocalImageToProxy, uploadToImageProxy } = require('./uploadService');
+const imageClient = require('./imageClient');
+const {
+  clampToGeminiImageAspectRatio,
+  clampToViduAspectRatio,
+  pickViduResolutionParam,
+  isGeminiOfficialHost,
+} = require('./mediaAspectRatioSpec');
 const {
   signKlingOfficialJwt,
   normalizeKlingCredential,
@@ -24,22 +31,40 @@ function inferVideoProtocol(provider) {
   if (p === 'kling' || p === 'klingai') return 'kling';
   if (p === 'jimeng_ai_api') return 'jimeng_ai_api';
   if (p === 'xai' || p === 'grok') return 'xai';
+  if (p === 'agnes') return 'agnes';
+  if (p === 'minimax_h3') return 'minimax_h3';
   return 'openai';
+}
+
+/** 官方模型 ID：MiniMax-H3（Video Generation V2） */
+function isMinimaxH3Model(name) {
+  const m = String(name || '').trim().toLowerCase();
+  return m === 'minimax-h3' || m === 'minimax_h3' || /^minimax[-_]?h3\b/.test(m);
 }
 
 /**
  * 显式 api_protocol 优先；未配置时推断。
  * Grok / xAI 官方为 prompt + aspect_ratio + GET /v1/videos/{request_id}，与中转站用的 ratio + content 不同。
+ * MiniMax-H3 走 V2（/v2/video_generation），与旧海螺 V1 不同。
  */
 function resolveVideoProtocol(config, modelHint) {
   const provider = (config.provider || '').toLowerCase();
   const explicit = String(config.api_protocol || '').trim();
   let protocol = explicit.toLowerCase() || inferVideoProtocol(provider);
   const baseLower = String(config.base_url || '').toLowerCase();
-  const modelLower = String(modelHint || '').toLowerCase();
+  const modelCand =
+    modelHint ||
+    config.default_model ||
+    (Array.isArray(config.model) ? config.model[0] : config.model) ||
+    '';
+  const modelLower = String(modelCand || '').toLowerCase();
   if (!explicit && protocol === 'openai') {
     if (/api\.x\.ai(\/|$)/.test(baseLower)) protocol = 'xai';
     else if (/grok-imagine|grok.*video/.test(modelLower)) protocol = 'xai';
+    else if (provider === 'agnes' || /agnes-video|apihub\.agnes-ai\.com/i.test(baseLower)) protocol = 'agnes';
+  }
+  if ((!explicit || protocol === 'openai') && (provider === 'minimax_h3' || isMinimaxH3Model(modelCand))) {
+    protocol = 'minimax_h3';
   }
   return protocol;
 }
@@ -315,7 +340,6 @@ async function resolveImageInputForOmniAsync(rawUrl, files_base_url, storage_loc
   const raw = (rawUrl || '').trim();
   if (!raw) return null;
   if (raw.startsWith('data:')) return raw;
-  if (raw.startsWith('asset://')) return raw;
 
   const isPublicHttp = /^https?:\/\//i.test(raw) && !/localhost|127\.0\.0\.1/i.test(raw);
   if (isPublicHttp) return raw;
@@ -333,19 +357,36 @@ async function resolveImageInputForOmniAsync(rawUrl, files_base_url, storage_loc
   return resolveImageInputForOmniLocalBase64(raw, files_base_url, storage_local_path, log, video_gen_id);
 }
 
+/** config.yaml：image_proxy.use_for_video=true 时才对视频全能模式走中转图床（默认 false，避免私有网关拉不到图床） */
+function useImageProxyForVideo() {
+  try {
+    const { loadConfig } = require('../config');
+    return !!(loadConfig()?.image_proxy?.use_for_video);
+  } catch (_) {
+    return false;
+  }
+}
+
 /**
- * 火山方舟 Seedance 全能/多图参考：参考图解析（公网 URL / 图床 / 本地 base64），与可灵 Omni 逻辑一致
+ * 火山方舟 Seedance 全能/多图参考：公网 URL 直传；本地图默认 base64；可选图床（use_for_video）
  */
 async function resolveVolcOmniImageAsync(rawUrl, files_base_url, storage_local_path, log, video_gen_id, index) {
   const raw = (rawUrl || '').trim();
   if (!raw) return null;
   if (raw.startsWith('data:')) return raw;
-  if (raw.startsWith('asset://')) return raw;
 
   const isPublicHttp = /^https?:\/\//i.test(raw) && !/localhost|127\.0\.0\.1/i.test(raw);
   if (isPublicHttp) return raw;
 
-  if (storage_local_path) {
+  if (storage_local_path && !useImageProxyForVideo()) {
+    const b64 = resolveVolcClassicImage(raw, files_base_url, storage_local_path, log, video_gen_id, `ref_${index}`);
+    if (b64 && String(b64).startsWith('data:')) {
+      log.info('[VolcOmni] 本地参考图 → base64（image_proxy.use_for_video 未启用）', { video_gen_id, index });
+      return b64;
+    }
+  }
+
+  if (storage_local_path && useImageProxyForVideo()) {
     const tag = `volc_omni_vg${video_gen_id}_${index}`;
     const proxyUrl = await uploadLocalImageToProxy(storage_local_path, raw, log, tag);
     if (proxyUrl) {
@@ -358,67 +399,136 @@ async function resolveVolcOmniImageAsync(rawUrl, files_base_url, storage_local_p
   return resolveImageInputForOmniLocalBase64(raw, files_base_url, storage_local_path, log, video_gen_id);
 }
 
-/** Seedance 2.x：时长吸附到 4–15 秒；旧版 Seedance 仍用 5/10 */
-function normalizeVolcOmniDuration(modelName, durationNum) {
-  const m = String(modelName || '').trim().toLowerCase();
-  // 方舟控制台常用推理接入点为 ep-xxxx，名称里不含 seedance-2，但仍多为 Seedance 2.x，需走 4–15 秒档位
-  const isV2 = /seedance[-_]?2|seedance2|2[-_]0[-_]/.test(m) || /^ep-/.test(m);
-  const d = Number(durationNum);
-  const safe = Number.isFinite(d) && d > 0 ? d : 5;
-  if (isV2) {
-    const allowed = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-    let best = 5;
-    let bestDiff = 999;
-    for (const a of allowed) {
-      const diff = Math.abs(a - safe);
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        best = a;
-      }
-    }
-    return best;
-  }
-  return safe <= 7 ? 5 : 10;
+/**
+ * Agnes Video：仅接受公网 http(s) 图片 URL，本地/localhost 须先上传图床，禁止 base64。
+ */
+function isPublicHttpUrl(url) {
+  return /^https?:\/\//i.test(url) && !/localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(url);
 }
 
-/** Seedance 2.x 且名称含 fast（如 doubao-seedance-2-0-fast）：方舟侧不支持 1080p（含 r2v）。不含 fast 的 2.0 等保持 1080p。 */
-function isVolcOmniSeedance2FastModel(modelName) {
-  const m = String(modelName || '').trim().toLowerCase();
-  if (!m.includes('seedance') || !m.includes('fast')) return false;
-  const is2x =
-    /(?:seedance[-_])?2\b|seedance2\b|[-_]2[-_]0[-_]|2\.0/.test(m);
-  return is2x;
+function isPublicFilesBaseUrl(files_base_url) {
+  const fb = (files_base_url || '').trim();
+  if (!fb || !/^https?:\/\//i.test(fb)) return false;
+  return !/localhost|127\.0\.0\.1|0\.0\.0\.0|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\./i.test(fb);
+}
+
+function localRefKeyFromRaw(raw) {
+  const s = (raw || '').trim();
+  if (!s || s.startsWith('data:')) return null;
+  if (s.includes('/static/')) {
+    return (s.split('/static/')[1] || '').split(/[?#]/)[0].replace(/^\/+/, '') || null;
+  }
+  if (/^https?:\/\//i.test(s)) return null;
+  return s.replace(/^\/+/, '') || null;
+}
+
+function publicUrlFromLocalRef(raw, files_base_url) {
+  const rel = localRefKeyFromRaw(raw);
+  if (!rel || !isPublicFilesBaseUrl(files_base_url)) return null;
+  return `${String(files_base_url).replace(/\/$/, '')}/${rel}`;
+}
+
+async function resolveImageInputForAgnesAsync(db, rawUrl, files_base_url, storage_local_path, log, video_gen_id, index) {
+  const raw = (rawUrl || '').trim();
+  if (!raw) return null;
+
+  if (isPublicHttpUrl(raw)) return raw;
+
+  const publicFromBase = publicUrlFromLocalRef(raw, files_base_url);
+  if (publicFromBase) {
+    log.info('[Agnes] 使用公网 static URL（跳过图床）', { video_gen_id, index, url_head: publicFromBase.slice(0, 64) });
+    return publicFromBase;
+  }
+
+  const cacheKey = localRefKeyFromRaw(raw);
+  if (db && cacheKey) {
+    const cached = await imageClient.getProxyCacheValidated(db, cacheKey, log, `agnes_vg${video_gen_id}_${index}`);
+    if (cached) {
+      log.info('[Agnes] 使用图床缓存 URL', { video_gen_id, index, cache_key: cacheKey });
+      return cached;
+    }
+  }
+
+  if (raw.startsWith('data:')) {
+    const m = /^data:([^;]+);base64,([\s\S]+)$/i.exec(raw);
+    if (m) {
+      const mime = (m[1] || 'image/jpeg').trim();
+      const b64 = String(m[2] || '').replace(/\s/g, '');
+      try {
+        const buf = Buffer.from(b64, 'base64');
+        if (buf.length > 0) {
+          const tag = `agnes_vg${video_gen_id}_${index}`;
+          const proxyUrl = await uploadToImageProxy(buf, mime, log, tag);
+          if (proxyUrl) {
+            log.info('[Agnes] base64 参考图已上传图床', { video_gen_id, index, url_head: proxyUrl.slice(0, 64) });
+            if (db && cacheKey) imageClient.setProxyCache(db, cacheKey, proxyUrl);
+            return proxyUrl;
+          }
+        }
+      } catch (e) {
+        log.warn('[Agnes] base64 解码或上传失败', { video_gen_id, index, error: e.message });
+      }
+    }
+    return null;
+  }
+
+  if (storage_local_path) {
+    const tag = `agnes_vg${video_gen_id}_${index}`;
+    const proxyUrl = await uploadLocalImageToProxy(storage_local_path, raw, log, tag);
+    if (proxyUrl) {
+      log.info('[Agnes] 本地参考图已上传图床', { video_gen_id, index, url_head: proxyUrl.slice(0, 64) });
+      if (db && cacheKey) imageClient.setProxyCache(db, cacheKey, proxyUrl);
+      return proxyUrl;
+    }
+  }
+
+  log.warn('[Agnes] 参考图无法转为公网 URL', { video_gen_id, index, raw_head: raw.slice(0, 80) });
+  return null;
 }
 
 /**
- * 仅对 Seedance 2.x **fast** 将 1080p 降为 720p，避免 r2v 400；其余模型原样提交。
- * 未知 resolution 枚举则省略，由接口默认。
+ * Seedance 2.x 家族：官方 doubao/jimeng 名称 + 中转别名（如 mingiz-sd2）。
+ * 用于时长归一、音色参考注入、content 是否带 reference_audio。
  */
-function normalizeVolcOmniResolution(modelName, resolution, log, video_gen_id) {
-  let r = (resolution != null ? String(resolution) : '').trim().toLowerCase();
-  if (!r) return { value: null };
-  if (r === '1080') r = '1080p';
-  if (r === '720') r = '720p';
-  if (r === '480') r = '480p';
+function isSeedance2FamilyModel(modelName) {
+  const m = String(modelName || '').toLowerCase().trim();
+  if (!m) return false;
+  if (/seedance[-_]?2|seedance2/.test(m)) return true;
+  if (/2[-_]0[-_]/.test(m)) return true;
+  // 网关别名：mingiz-sd2、foo_sd2、sd2-bar
+  if (/(^|[-_./])sd2($|[-_./])/.test(m)) return true;
+  return false;
+}
 
-  if (isVolcOmniSeedance2FastModel(modelName) && r === '1080p') {
-    if (log?.info) {
-      log.info('[VolcOmni] resolution 1080p 对 Seedance 2.x fast 不可用，已改为 720p', {
-        video_gen_id,
-        model: modelName,
-      });
-    }
-    return { value: '720p' };
+/**
+ * 火山 Seedance 系列：按模型版本归一化时长（秒）。
+ * - 2.x：4–15
+ * - 1.5 Pro/Lite：5–12（官方文档）
+ * - 1.0 Pro/Lite：仅 5 或 10
+ */
+function normalizeVolcengineDuration(modelName, durationNum) {
+  const m = String(modelName || '').toLowerCase();
+  const d = Number(durationNum);
+  const safe = Number.isFinite(d) && d > 0 ? Math.round(d) : 5;
+
+  if (isSeedance2FamilyModel(m)) {
+    return Math.min(15, Math.max(4, safe));
   }
 
-  const allowed = ['480p', '720p', '1080p'];
-  if (!allowed.includes(r)) {
-    if (log?.warn) {
-      log.warn('[VolcOmni] resolution 非标准枚举，已省略', { video_gen_id, resolution });
-    }
-    return { value: null };
+  if (/seedance[-_]?1[-_.]?5|1-5-pro|1-5-lite|251215/.test(m)) {
+    return Math.min(12, Math.max(5, safe));
   }
-  return { value: r };
+
+  if (/seedance|doubao-seedance/.test(m)) {
+    return safe <= 7 ? 5 : 10;
+  }
+
+  return Math.min(12, Math.max(5, safe));
+}
+
+/** @deprecated 名称保留，实现与 normalizeVolcengineDuration 一致 */
+function normalizeVolcOmniDuration(modelName, durationNum) {
+  return normalizeVolcengineDuration(modelName, durationNum);
 }
 
 /**
@@ -441,6 +551,7 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
     files_base_url,
     storage_local_path,
     video_gen_id,
+    voice_reference_url,   // Seedance 2.0 音色参考（全能模式专用）
   } = opts;
 
   const url = buildVideoUrl(config, { defaultEndpoint: '/v1/videos/generations' });
@@ -448,7 +559,6 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
   const finalModel = normalizeVolcModel(model);
   const ratio = aspect_ratio || '16:9';
   const effectiveDuration = normalizeVolcOmniDuration(finalModel, duration);
-  const { value: effectiveResolution } = normalizeVolcOmniResolution(finalModel, resolution, log, video_gen_id);
 
   const refList = Array.isArray(reference_urls) ? reference_urls.filter(Boolean) : [];
   const primary = (image_url || '').trim();
@@ -463,11 +573,10 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
     duration: effectiveDuration,
     watermark: watermark != null ? Boolean(watermark) : false,
   };
-  if (effectiveResolution) body.resolution = effectiveResolution;
+  if (resolution) body.resolution = resolution;
   if (seed != null) body.seed = Number(seed);
   if (camera_fixed != null) body.camera_fixed = Boolean(camera_fixed);
 
-  let volcOmniAssetRefCount = 0;
   if (urls.length) {
     for (let i = 0; i < urls.length; i++) {
       let u = await resolveVolcOmniImageAsync(
@@ -479,7 +588,6 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
         i
       );
       if (!u) continue;
-      if (String(u).startsWith('asset://')) volcOmniAssetRefCount += 1;
       if (/localhost|127\.0\.0\.1/i.test(u) && storage_local_path && (files_base_url || '').match(/localhost|127\.0\.0\.1/i)) {
         const baseUrl = (files_base_url || '').replace(/\/$/, '');
         const afterStatic = u.split('/static/')[1] || (baseUrl ? u.replace(baseUrl + '/', '').replace(baseUrl, '') : null);
@@ -505,24 +613,87 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
         role: 'reference_image',
       };
       body.content.push(part);
-      if (String(u).startsWith('asset://') && log?.info) {
-        log.info('[VolcOmni][SD2] content 使用素材库 asset 引用', { video_gen_id, index: i, asset_head: String(u).slice(0, 80) });
-      }
     }
-    // if (body.content.length > 1) body.task_type = 'i2v';
+    if (body.content.length > 1) body.task_type = 'i2v';
+  }
+
+  // Seedance 2.0 音色参考：本路径仅 volcengine_omni 调用；有 URL 即注入（网关别名如 mingiz-sd2 也要生效）
+  if (opts.voice_reference_url) {
+    let voiceUrl = String(opts.voice_reference_url).trim();
+    if (voiceUrl) {
+      // 复用图片的本地文件转 base64 逻辑
+      if (/localhost|127\.0\.0\.1/i.test(voiceUrl) && storage_local_path && (files_base_url || '').match(/localhost|127\.0\.0\.1/i)) {
+        const baseUrl = (files_base_url || '').replace(/\/$/, '');
+        const afterStatic = voiceUrl.split('/static/')[1] || (baseUrl ? voiceUrl.replace(baseUrl + '/', '').replace(baseUrl, '') : null);
+        const relPath = afterStatic ? afterStatic.replace(/^\//, '') : null;
+        if (relPath) {
+          const filePath = path.join(storage_local_path, relPath);
+          try {
+            if (fs.existsSync(filePath)) {
+              const buf = fs.readFileSync(filePath);
+              const ext = path.extname(filePath).toLowerCase();
+              const mime =
+                { '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.ogg': 'audio/ogg' }[ext] || 'audio/mpeg';
+              voiceUrl = 'data:' + mime + ';base64,' + buf.toString('base64');
+            }
+          } catch (_) {}
+        }
+      }
+      body.content.push({
+        type: 'audio_url',
+        audio_url: { url: voiceUrl },
+        role: 'reference_audio',
+      });
+      log.info('[VolcOmni] 已注入 Seedance 2.0 音色参考音频', { video_gen_id, voice_ref: String(opts.voice_reference_url).slice(0, 80) });
+    }
+  }
+
+  // ===== 全能模式（Seedance 2.0 / Omni）最终请求结构体日志 =====
+  // 方便调试确认：图片参考 + 音色参考是否真正被加入 content 数组
+  try {
+    const contentSummary = body.content.map((part, idx) => {
+      const t = part.type || 'unknown';
+      const role = part.role || null;
+      let preview = '';
+      if (t === 'text' && part.text) {
+        preview = String(part.text).slice(0, 80);
+      } else if (part.image_url?.url) {
+        preview = String(part.image_url.url).slice(0, 80);
+      } else if (part.audio_url?.url) {
+        preview = String(part.audio_url.url).slice(0, 80);
+      }
+      return { idx, type: t, role, preview };
+    });
+
+    const hasAudioRef = body.content.some(p => p.role === 'reference_audio' || p.type === 'audio_url');
+
+    log.info('[VolcOmni][全能结构体] 最终发往火山的 content 概览（含音色参考验证）', {
+      video_gen_id,
+      model: finalModel,
+      content_length: body.content.length,
+      has_reference_audio: hasAudioRef,
+      voice_reference_url_from_opts: voice_reference_url ? String(voice_reference_url).slice(0, 100) : null,
+      content_summary: contentSummary
+    });
+  } catch (e) {
+    log.warn('[VolcOmni] 结构体日志序列化失败', { error: e.message });
   }
 
   log.info('[VolcOmni] 创建任务', {
     url,
-    body
-    // model: finalModel,
-    // ratio,
-    // duration: effectiveDuration,
-    // resolution: effectiveResolution || '(默认)',
-    // image_count: urls.length,
-    // asset_ref_count: volcOmniAssetRefCount,
-    // video_gen_id,
-    // prompt_head: ((prompt || '').trim()).slice(0, 120),
+    model: finalModel,
+    ratio,
+    duration: effectiveDuration,
+    image_count: urls.length,
+    has_voice_ref: !!voice_reference_url,
+    video_gen_id,
+  });
+  logVideoPostRequest(log, 'VolcOmni', url, body, video_gen_id, {
+    model: finalModel,
+    ratio,
+    duration: effectiveDuration,
+    image_count: urls.length,
+    has_voice_ref: !!voice_reference_url,
   });
 
   const res = await fetch(url, {
@@ -666,7 +837,12 @@ async function callKlingOmniVideoApi(config, log, opts) {
     aspect_ratio: ratio,
     image_count: image_list.length,
     video_gen_id,
-    prompt_head: textPrompt.slice(0, 120),
+  });
+  logVideoPostRequest(log, 'KlingOmni', createUrl, body, video_gen_id, {
+    model_name: modelName,
+    duration: durStr,
+    aspect_ratio: ratio,
+    image_count: image_list.length,
   });
 
   const res = await fetch(createUrl, { method: 'POST', headers, body: JSON.stringify(body) });
@@ -783,13 +959,115 @@ function buildVideoUrl(config, options = {}) {
   return base + ep;
 }
 
-function buildQueryUrl(config, taskId) {
+/**
+ * Agnes / new-api 渠道根地址（与 new-api agnes.apiOrigin 一致）：
+ * 配置里常带 .../v1 或 .../v1/videos，需剥掉后再拼 /v1/videos/{task_id}。
+ */
+function getAgnesApiRoot(baseUrl) {
+  let base = String(baseUrl || 'https://apihub.agnes-ai.com').replace(/\/$/, '');
+  for (const suf of ['/v1/videos', '/v1']) {
+    if (base.length >= suf.length && base.slice(-suf.length).toLowerCase() === suf) {
+      base = base.slice(0, -suf.length).replace(/\/$/, '');
+    }
+  }
+  return base || 'https://apihub.agnes-ai.com';
+}
+
+/** 内置/历史默认查询路径：由代码统一按 new-api 拼装，忽略配置里的旧值 */
+function isAgnesBuiltinQueryEndpoint(ep) {
+  const s = String(ep || '').trim();
+  if (!s) return true;
+  return (
+    /^\/?(v1\/)?videos\/\{(taskId|task_id|id|videoId|video_id)\}\/?$/i.test(s) ||
+    /^\/?agnesapi(\?|$)/i.test(s)
+  );
+}
+
+/**
+ * Agnes 结果查询：
+ * - Video 2.5 / 2.5 Flash：GET {origin}/agnesapi?video_id=&model_name=
+ * - Video V2.0：GET {origin}/v1/videos/{task_id}
+ */
+function isAgnesVideo25Model(model) {
+  return /agnes-video-2\.5/i.test(String(model || ''));
+}
+
+function isAgnesVideo25FlashModel(model) {
+  return /agnes-video-2\.5-flash/i.test(String(model || ''));
+}
+
+function resolveAgnesVideoModel(config, explicitModel) {
+  const named = String(explicitModel || '').trim();
+  if (named) return named;
+  return getModelFromConfig(config) || '';
+}
+
+function buildAgnesPollUrl(config, pollId, explicitModel) {
+  const root = getAgnesApiRoot(config.base_url);
+  const id = String(pollId || '').trim();
+  const cfgEp = String(config.query_endpoint || '').trim();
+  const model = resolveAgnesVideoModel(config, explicitModel);
+
+  if (cfgEp && !isAgnesBuiltinQueryEndpoint(cfgEp)) {
+    const base = (config.base_url || '').replace(/\/$/, '');
+    let ep = cfgEp;
+    ep = String(ep)
+      .replace(/\{videoId\}/gi, encodeURIComponent(id))
+      .replace(/\{video_id\}/gi, encodeURIComponent(id))
+      .replace(/\{taskId\}/gi, encodeURIComponent(id))
+      .replace(/\{task_id\}/gi, encodeURIComponent(id))
+      .replace(/\{id\}/gi, encodeURIComponent(id))
+      .replace(/\{model\}/gi, encodeURIComponent(model))
+      .replace(/\{model_name\}/gi, encodeURIComponent(model));
+    if (!ep.startsWith('/')) ep = '/' + ep;
+    return base + ep;
+  }
+
+  if (isAgnesVideo25Model(model)) {
+    const params = new URLSearchParams({ video_id: id, model_name: model });
+    return `${root}/agnesapi?${params.toString()}`;
+  }
+
+  return `${root}/v1/videos/${encodeURIComponent(id)}`;
+}
+
+/**
+ * 对齐 new-api：extractVideoURL + taskcommon.ExtractVideoURLFromJSON，
+ * 并兼容当前 Agnes 完成态把直链放在 metadata.url（实测 2026-07）。
+ */
+function extractAgnesVideoUrl(data) {
+  if (!data || typeof data !== 'object') return null;
+  const nested = (obj, key) =>
+    obj && typeof obj === 'object' && !Array.isArray(obj) ? obj[key] : null;
+  const candidates = [
+    data.video_url,
+    nested(data.content, 'video_url'),
+    nested(data.data, 'video_url'),
+    nested(data.data, 'url'),
+    // 当前官方完成态：metadata.url 才是 MP4 直链
+    nested(data.metadata, 'url'),
+    nested(data.metadata, 'video_url'),
+    nested(data.metadata, 'result_url'),
+    data.remixed_from_video_id,
+    nested(data.data, 'remixed_from_video_id'),
+    data.url,
+  ];
+  for (const c of candidates) {
+    const u = coerceHttpVideoUrl(c);
+    if (u) return u;
+  }
+  return pickProxyVideoUrl(data);
+}
+
+function buildQueryUrl(config, taskId, extras = {}) {
   const p = (config.provider || '').toLowerCase();
   const proto = resolveVideoProtocol(config);
   const isDashScope = proto === 'dashscope' || p === 'dashscope';
   const isVolc = p === 'volces' || p === 'volcengine' || p === 'volc';
   const isSora = proto === 'sora';
   if (isVolc) return getVolcVideoBase(config) + VOLC_VIDEO_QUERY_PATH + '/' + encodeURIComponent(taskId);
+  if (proto === 'agnes') return buildAgnesPollUrl(config, taskId, extras.model);
+  if (proto === 'minimax_h3') return buildMinimaxH3PollUrl(config, taskId);
   const base = (config.base_url || '').replace(/\/$/, '');
   let defaultEp;
   if (isSora) defaultEp = '/v1/videos/{taskId}';
@@ -909,6 +1187,8 @@ function videoUrlFromRecord(rec) {
     coerceHttpVideoUrl(rec.result_url) ||
     coerceHttpVideoUrl(rec.url) ||
     coerceHttpVideoUrl(rec.output_url) ||
+    // Agnes Video V2.0 完成态有时将 MP4 直链放在 remixed_from_video_id
+    coerceHttpVideoUrl(rec.remixed_from_video_id) ||
     null
   );
 }
@@ -987,12 +1267,22 @@ function pickProxyVideoUrl(data) {
   }
   let u = videoUrlFromRecord(data);
   if (u) return u;
+  // 中转站 / Seedance 完成态常见：直链在 metadata.url（非顶层 video_url）
+  const meta = data.metadata;
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    u = videoUrlFromRecord(meta);
+    if (u) return u;
+  }
   const d = data.data;
   if (d && typeof d === 'object' && !Array.isArray(d)) {
     const nestedList = pickVideoUrlFromItemList(d.item_list);
     if (nestedList) return nestedList;
     u = videoUrlFromRecord(d);
     if (u) return u;
+    if (d.metadata && typeof d.metadata === 'object' && !Array.isArray(d.metadata)) {
+      u = videoUrlFromRecord(d.metadata);
+      if (u) return u;
+    }
     if (d.video && typeof d.video === 'object') {
       const dv =
         videoUrlFromArkVideoNode(d.video) ||
@@ -1106,9 +1396,7 @@ async function callKlingVideoApi(config, log, opts) {
   let imageInput = null;
   const rawImgUrl = (image_url || '').trim();
   if (rawImgUrl) {
-    if (rawImgUrl.startsWith('asset://')) {
-      imageInput = rawImgUrl;
-    } else if (rawImgUrl.startsWith('data:')) {
+    if (rawImgUrl.startsWith('data:')) {
       imageInput = rawImgUrl;
     } else if (/localhost|127\.0\.0\.1/i.test(rawImgUrl) && storage_local_path) {
       const baseUrl = (files_base_url || '').replace(/\/$/, '');
@@ -1164,8 +1452,8 @@ async function callKlingVideoApi(config, log, opts) {
       model: m,
       prompt: prompt || '',
       image: { type: 'url', url: imageInput },
-      duration: klingDuration,
       aspect_ratio: ratio,
+      duration: klingDuration,
       cfg_scale: 0.5,
       callback_url: '',
     };
@@ -1181,14 +1469,17 @@ async function callKlingVideoApi(config, log, opts) {
     };
   }
 
-  const bodyForLog = {
-    ...body,
-    image: body.image ? { ...body.image, url: body.image.url?.startsWith('data:') ? '(base64)' : body.image.url } : undefined,
-  };
   log.info('[Kling视频] 发送请求', {
     url: createUrl, model: m, task_type: taskType,
     has_image: hasImage, duration: klingDuration, ratio,
-    video_gen_id, body_preview: JSON.stringify(bodyForLog).slice(0, 400),
+    video_gen_id,
+  });
+  logVideoPostRequest(log, 'Kling', createUrl, body, video_gen_id, {
+    model: m,
+    task_type: taskType,
+    has_image: hasImage,
+    duration: klingDuration,
+    ratio,
   });
 
   const res = await fetch(createUrl, { method: 'POST', headers, body: JSON.stringify(body) });
@@ -1276,7 +1567,6 @@ async function callDashScopeVideoApi(config, log, opts) {
   function toImageInput(value) {
     if (!value || !String(value).trim()) return null;
     const s = String(value).trim();
-    if (s.startsWith('asset://')) return s;
     let relPath = null;
     if (s.startsWith('http://') || s.startsWith('https://')) {
       if (!isLocalhost || !storage_local_path) return s;
@@ -1425,7 +1715,7 @@ async function callGeminiVideoApi(config, log, opts) {
 
   // durationSeconds ??? 5-8 ?
   const durationSec = Math.min(8, Math.max(5, Math.round(Number(duration) || 8)));
-  const ratio = aspect_ratio || '16:9';
+  const ratio = clampToGeminiImageAspectRatio(aspect_ratio || '16:9');
 
   const instance = { prompt: prompt || '' };
 
@@ -1434,9 +1724,7 @@ async function callGeminiVideoApi(config, log, opts) {
     let imageB64 = null;
     let mimeType = 'image/jpeg';
     const imgUrl = image_url.trim();
-    if (imgUrl.startsWith('asset://')) {
-      log.warn('[Gemini视频] Veo 不支持 asset:// 素材引用，跳过参考图', { video_gen_id });
-    } else if (imgUrl.startsWith('data:')) {
+    if (imgUrl.startsWith('data:')) {
       const m = imgUrl.match(/^data:([\w/]+);base64,(.+)$/);
       if (m) { imageB64 = m[2]; mimeType = m[1]; }
     } else if ((files_base_url || '').match(/localhost|127\.0\.0\.1/i) && storage_local_path) {
@@ -1470,17 +1758,28 @@ async function callGeminiVideoApi(config, log, opts) {
     }
   }
 
+  const parameters = {
+    aspectRatio: ratio,
+    durationSeconds: durationSec,
+    sampleCount: 1,
+  };
+  if (!isGeminiOfficialHost(base)) {
+    parameters.aspect_ratio = ratio;
+  }
   const body = {
     instances: [instance],
-    parameters: {
-      aspectRatio: ratio,
-      durationSeconds: durationSec,
-      sampleCount: 1,
-    },
+    parameters,
   };
 
   const url = `${base}/v1beta/models/${encodeURIComponent(modelName)}:predictLongRunning`;
-  log.info('Gemini Video API request', { model: modelName, ratio, durationSec, video_gen_id, has_image: !!instance.image });
+  log.info('Gemini Video API request', {
+    model: modelName,
+    ratio,
+    official_field: 'parameters.aspectRatio',
+    durationSec,
+    video_gen_id,
+    has_image: !!instance.image,
+  });
 
   const res = await fetch(url, {
     method: 'POST',
@@ -1520,6 +1819,176 @@ async function callGeminiVideoApi(config, log, opts) {
   return { error: 'Gemini ??? operation name???? API Key ?????' };
 }
 
+/** 解析 "16:9"、"21:9" 等为 宽/高 数值比 */
+function parseViduAspectRatio(aspectStr) {
+  const t = String(aspectStr || '').trim();
+  const m = t.match(/^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$/);
+  if (!m || Number(m[2]) === 0) return null;
+  return Number(m[1]) / Number(m[2]);
+}
+
+/** 参考图宽高比(宽/高) 与目标比例差异超过容差则视为不一致 */
+function viduImageAspectMismatchesTarget(imgW, imgH, targetAspectStr, relTol = 0.06) {
+  const tgt = parseViduAspectRatio(targetAspectStr);
+  if (tgt == null || !imgW || !imgH || imgH <= 0) return false;
+  const imgR = imgW / imgH;
+  const diff = Math.abs(imgR - tgt) / Math.max(imgR, tgt, 0.01);
+  return diff > relTol;
+}
+
+/** Vidu 常见比例 → 画布像素（宽×高），与 720p 量级一致，便于 img2video 画幅与目标一致 */
+function viduLetterboxCanvasPixels(aspectStr) {
+  const m = {
+    '16:9': [1280, 720],
+    '9:16': [720, 1280],
+    '1:1': [720, 720],
+    '4:3': [960, 720],
+    '3:4': [720, 960],
+    '21:9': [1680, 720],
+  };
+  return m[String(aspectStr || '').trim()] || null;
+}
+
+/**
+ * 加载参考图为 Buffer（与 probe 同源）。不修改磁盘上的原文件。
+ */
+async function loadViduReferenceImageBuffer(rawImgUrl, publicImgUrl, storage_local_path, log, video_gen_id) {
+  try {
+    let buf = null;
+    const raw = (rawImgUrl || '').trim();
+    if (raw.startsWith('data:image')) {
+      const i = raw.indexOf(',');
+      const b64 = i >= 0 ? raw.slice(i + 1) : '';
+      buf = Buffer.from(b64, 'base64');
+    } else if (/localhost|127\.0\.0\.1/i.test(raw) && storage_local_path) {
+      const afterStatic = raw.split('/static/')[1];
+      if (afterStatic) {
+        const localFile = path.join(storage_local_path, afterStatic.replace(/^\//, ''));
+        if (fs.existsSync(localFile)) buf = fs.readFileSync(localFile);
+      }
+    }
+    if (!buf) {
+      const fetchUrl = (publicImgUrl || '').trim() || raw;
+      if (!fetchUrl || fetchUrl.startsWith('data:')) return null;
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 25000);
+      try {
+        const res = await fetch(fetchUrl, { signal: ac.signal });
+        if (!res.ok) return null;
+        buf = Buffer.from(await res.arrayBuffer());
+      } finally {
+        clearTimeout(timer);
+      }
+      if (buf.length > 25 * 1024 * 1024) return null;
+    }
+    return buf;
+  } catch (e) {
+    log.warn('[Vidu] load reference image buffer failed', { error: e.message, video_gen_id });
+    return null;
+  }
+}
+
+/** 将图 contain 到目标比例画布（黑边），使像素比例与 Vidu aspect_ratio 一致，供 img2video 跟随画幅 */
+async function letterboxBufferToViduAspect(imageBuffer, aspectStr, log, video_gen_id) {
+  if (!sharp || !imageBuffer) return null;
+  const box = viduLetterboxCanvasPixels(aspectStr);
+  if (!box) return null;
+  const [cw, ch] = box;
+  try {
+    const out = await sharp(imageBuffer, { failOn: 'none' })
+      .rotate()
+      .resize(cw, ch, {
+        fit: 'contain',
+        position: 'centre',
+        background: { r: 0, g: 0, b: 0, alpha: 1 },
+      })
+      .jpeg({ quality: 88, mozjpeg: true })
+      .toBuffer();
+    log.info('[Vidu] letterbox OK', { video_gen_id, target_aspect: aspectStr, canvas: `${cw}x${ch}`, out_kb: Math.round(out.length / 1024) });
+    return out;
+  } catch (e) {
+    log.warn('[Vidu] letterbox failed', { video_gen_id, error: e.message });
+    return null;
+  }
+}
+
+/**
+ * 读取参考图像素尺寸（用于与目标画幅对比）。不修改图片。
+ * 优先读本地 static 文件；否则拉取 public URL。
+ */
+async function probeViduReferenceImageSize(rawImgUrl, publicImgUrl, storage_local_path, log, video_gen_id) {
+  if (!sharp) {
+    log.info('[Vidu] probe image: skipped (sharp unavailable)', { video_gen_id });
+    return null;
+  }
+  try {
+    let probeSource = '';
+    const raw = (rawImgUrl || '').trim();
+    if (raw.startsWith('data:image')) {
+      probeSource = 'data_url';
+    } else if (/localhost|127\.0\.0\.1/i.test(raw) && storage_local_path) {
+      const afterStatic = raw.split('/static/')[1];
+      if (afterStatic) {
+        const localFile = path.join(storage_local_path, afterStatic.replace(/^\//, ''));
+        if (fs.existsSync(localFile)) probeSource = 'local_static';
+        else log.info('[Vidu] probe image: local path missing, will try fetch', { video_gen_id, localFile });
+      }
+    }
+    if (!probeSource) {
+      const fetchUrl = (publicImgUrl || '').trim() || raw;
+      if (fetchUrl && !fetchUrl.startsWith('data:')) {
+        probeSource = 'http_fetch';
+        log.info('[Vidu] probe image: fetching', {
+          video_gen_id,
+          url_head: fetchUrl.length > 160 ? fetchUrl.slice(0, 160) + '…' : fetchUrl,
+          url_len: fetchUrl.length,
+        });
+      }
+    }
+    const buf = await loadViduReferenceImageBuffer(rawImgUrl, publicImgUrl, storage_local_path, log, video_gen_id);
+    if (!buf) {
+      log.info('[Vidu] probe image: no buffer', { video_gen_id, has_public: !!publicImgUrl });
+      return null;
+    }
+    if (probeSource === 'data_url') log.info('[Vidu] probe image: source=data URL', { video_gen_id, bytes: buf.length });
+    if (probeSource === 'local_static') {
+      const afterStatic = raw.split('/static/')[1];
+      const localFile = path.join(storage_local_path, afterStatic.replace(/^\//, ''));
+      log.info('[Vidu] probe image: source=local file', { video_gen_id, localFile, bytes: buf.length });
+    }
+    if (probeSource === 'http_fetch') log.info('[Vidu] probe image: fetch ok', { video_gen_id, bytes: buf.length });
+
+    const meta = await sharp(buf, { failOn: 'none' }).rotate().metadata();
+    const w = meta.width;
+    const h = meta.height;
+    if (!w || !h) {
+      log.warn('[Vidu] probe image: no width/height in metadata', { video_gen_id, meta: { w, h, orientation: meta.orientation } });
+      return null;
+    }
+    const whRatio = w / h;
+    log.info('[Vidu] probe image: dimensions', {
+      video_gen_id,
+      source: probeSource || 'unknown',
+      width: w,
+      height: h,
+      wh_ratio: Number(whRatio.toFixed(6)),
+    });
+    return { width: w, height: h };
+  } catch (e) {
+    log.warn('[Vidu] probe image dimensions failed', { error: e.message, video_gen_id });
+    return null;
+  }
+}
+
+/** 图生视频时参考图比例与目标不一致：强调参考图仅作内容参考，按目标画幅生成（不改原图） */
+function viduMismatchAspectPromptSuffix(targetRatioLabel) {
+  const r = targetRatioLabel || '16:9';
+  return (
+    `【画幅】参考图仅作角色、场景与风格参考，请勿沿用参考图的画幅比例；请按 ${r} 宽高比输出整段视频，构图与运镜可在该比例下自由发挥。` +
+    ` The reference image is for subject/scene/style only; output the full video in aspect ratio ${r}, not the reference frame shape.`
+  );
+}
+
 /**
  * ?? Vidu ???? API??? api.vidu.cn/ent/v2?
  * ???Authorization: Token {api_key}?? Bearer?
@@ -1528,13 +1997,14 @@ async function callGeminiVideoApi(config, log, opts) {
  * ?????viduq2 / viduq2-pro / viduq2-turbo / viduq3-pro
  */
 async function callViduVideoApi(config, log, opts) {
-  const { prompt, model, duration, aspect_ratio, image_url, video_gen_id, files_base_url, storage_local_path } = opts;
+  const { prompt, model, duration, aspect_ratio, resolution: resolutionOpt, image_url, video_gen_id, files_base_url, storage_local_path } = opts;
   const apiKey = config.api_key || '';
   const base = (config.base_url || 'https://api.vidu.cn').replace(/\/$/, '');
   const modelName = model || 'viduq2';
   const dur = Math.min(10, Math.max(1, Math.round(Number(duration) || 5)));
-  const ratio = aspect_ratio || '16:9';
+  const ratio = clampToViduAspectRatio(aspect_ratio || '16:9');
   const hasImage = !!(image_url && image_url.trim());
+  const resolutionBody = pickViduResolutionParam(resolutionOpt, modelName, hasImage);
 
   // ?? api.vidu.cn: Token ??????: Bearer ??
   const isOfficialVidu = /api\.vidu\.cn/i.test(base);
@@ -1546,22 +2016,44 @@ async function callViduVideoApi(config, log, opts) {
   if (!ep.startsWith('/')) ep = '/' + ep;
   const url = base + ep;
 
+  let effectivePrompt = (prompt || '').trim();
+
+  log.info('[Vidu] task prepare', {
+    video_gen_id,
+    base_url: base,
+    endpoint: ep,
+    full_url: url,
+    mode: hasImage ? 'img2video' : 'text2video',
+    model: modelName,
+    duration_sec: dur,
+    aspect_ratio_effective: ratio,
+    aspect_ratio_from_opts: aspect_ratio != null && aspect_ratio !== '' ? aspect_ratio : '(fallback 16:9)',
+    resolution_body: resolutionBody,
+    official_fields: 'aspect_ratio + resolution (Vidu ent/v2)',
+    prompt_chars: effectivePrompt.length,
+    has_image_url: hasImage,
+    custom_endpoint: !!(config.endpoint && String(config.endpoint).trim()),
+  });
+
   const body = {
     model: modelName,
-    prompt: prompt || '',
+    prompt: effectivePrompt,
     duration: dur,
-    resolution: '720p',
+    resolution: resolutionBody,
     aspect_ratio: ratio,
     movement_amplitude: 'auto',
     audio: false,
     off_peak: false,
     watermark: false,
   };
+  if (!isOfficialVidu) {
+    body.aspectRatio = ratio;
+  }
 
+  let publicImgUrl = null;
   // ????localhost ? ??????? URL
   if (hasImage) {
     const rawImgUrl = image_url.trim();
-    let publicImgUrl = null;
     if (/localhost|127\.0\.0\.1/i.test(rawImgUrl)) {
       log.info('[Vidu] ???? localhost???????', { original: rawImgUrl, video_gen_id });
       publicImgUrl = await uploadLocalImageToProxy(storage_local_path, rawImgUrl, log, `vidu_vg${video_gen_id}`);
@@ -1576,14 +2068,102 @@ async function callViduVideoApi(config, log, opts) {
     } else {
       publicImgUrl = rawImgUrl;
     }
-    if (publicImgUrl) body.images = [publicImgUrl];
+    if (publicImgUrl) {
+      let imageUrlForVidu = publicImgUrl;
+      const dims = await probeViduReferenceImageSize(rawImgUrl, publicImgUrl, storage_local_path, log, video_gen_id);
+      const tgtNum = parseViduAspectRatio(ratio);
+      const relTol = 0.06;
+      const aspectMismatch = !!(dims && tgtNum != null && viduImageAspectMismatchesTarget(dims.width, dims.height, ratio, relTol));
+      if (!dims) {
+        log.info('[Vidu] aspect check: skipped (could not read image dimensions)', { video_gen_id, target_ratio: ratio });
+      } else {
+        const imgR = dims.width / dims.height;
+        const relDiff = tgtNum != null ? Math.abs(imgR - tgtNum) / Math.max(imgR, tgtNum, 0.01) : null;
+        log.info('[Vidu] aspect check', {
+          video_gen_id,
+          image_px: `${dims.width}x${dims.height}`,
+          image_wh_ratio: Number(imgR.toFixed(6)),
+          target_ratio_str: ratio,
+          target_wh_ratio: tgtNum != null ? Number(tgtNum.toFixed(6)) : null,
+          rel_diff: relDiff != null ? Number(relDiff.toFixed(6)) : null,
+          tolerance_rel: relTol,
+          mismatch: aspectMismatch,
+        });
+      }
+
+      // img2video 实际画幅跟参考图像素比例走；仅靠 aspect_ratio 字段与 prompt 不可靠 → 比例不一致时生成留白图再上传（原图文件不改）
+      let usedLetterbox = false;
+      if (aspectMismatch && viduLetterboxCanvasPixels(ratio)) {
+        const srcBuf = await loadViduReferenceImageBuffer(rawImgUrl, publicImgUrl, storage_local_path, log, video_gen_id);
+        if (srcBuf) {
+          const lbBuf = await letterboxBufferToViduAspect(srcBuf, ratio, log, video_gen_id);
+          if (lbBuf) {
+            const lbUrl = await uploadToImageProxy(lbBuf, 'image/jpeg', log, `vidu_vg${video_gen_id}_ar`);
+            if (lbUrl) {
+              imageUrlForVidu = lbUrl;
+              usedLetterbox = true;
+              log.info('[Vidu] img2video will use letterboxed reference (target aspect)', { video_gen_id, target_ratio: ratio });
+            } else {
+              log.warn('[Vidu] letterbox upload failed, falling back to original image + prompt hint', { video_gen_id });
+            }
+          }
+        }
+      }
+
+      if (aspectMismatch && !usedLetterbox) {
+        const suffix = viduMismatchAspectPromptSuffix(ratio);
+        const sep = '\n\n';
+        let combined = effectivePrompt ? `${effectivePrompt}${sep}${suffix}` : suffix;
+        const maxLen = 5000;
+        if (combined.length > maxLen) {
+          const room = maxLen - suffix.length - sep.length;
+          const head = room > 0 && effectivePrompt ? effectivePrompt.slice(0, room) : '';
+          combined = head ? `${head}${sep}${suffix}` : suffix.slice(0, maxLen);
+        }
+        effectivePrompt = combined;
+        body.prompt = effectivePrompt;
+        log.info('[Vidu] appended framing hint to prompt (mismatch, no letterbox)', {
+          video_gen_id,
+          image: dims ? `${dims.width}x${dims.height}` : '?',
+          target_ratio: ratio,
+          prompt_chars_after: effectivePrompt.length,
+          suffix_chars: suffix.length,
+        });
+      } else if (dims && !aspectMismatch) {
+        log.info('[Vidu] no letterbox / prompt suffix (reference aspect within tolerance of target)', { video_gen_id });
+      } else if (aspectMismatch && usedLetterbox) {
+        log.info('[Vidu] letterbox applied; skipping long framing prompt suffix', { video_gen_id });
+      }
+
+      body.images = [imageUrlForVidu];
+      try {
+        const u = new URL(imageUrlForVidu);
+        log.info('[Vidu] reference image URL (for API)', {
+          video_gen_id,
+          host: u.host,
+          pathname: u.pathname,
+          search: u.search ? '(has query)' : '',
+          letterboxed: usedLetterbox,
+        });
+      } catch (_) {
+        log.info('[Vidu] reference image URL (for API, non-URL string)', {
+          video_gen_id,
+          head: imageUrlForVidu.length > 120 ? imageUrlForVidu.slice(0, 120) + '…' : imageUrlForVidu,
+          letterboxed: usedLetterbox,
+        });
+      }
+    } else {
+      log.info('[Vidu] no public image URL after resolve; img2video body may be invalid', { video_gen_id, raw_was_localhost: /localhost|127\.0\.0\.1/i.test(image_url.trim()) });
+    }
   }
 
   log.info('[Vidu] Video API request', {
     url, model: modelName, auth: isOfficialVidu ? 'Token' : 'Bearer',
     dur, has_image: !!body.images, video_gen_id,
+    aspect_ratio_in_json: body.aspect_ratio,
+    prompt_chars_final: (body.prompt || '').length,
   });
-  log.info('[Vidu] request body', { body: JSON.stringify({ ...body, images: body.images ? ['(url)'] : undefined }), video_gen_id });
+  logVideoPostRequest(log, 'Vidu', url, body, video_gen_id, { model: modelName, auth: isOfficialVidu ? 'Token' : 'Bearer' });
 
   const res = await fetch(url, {
     method: 'POST',
@@ -1591,7 +2171,12 @@ async function callViduVideoApi(config, log, opts) {
     body: JSON.stringify(body),
   });
   const raw = await res.text();
-  log.info('[Vidu] raw response', { status: res.status, raw: raw.slice(0, 600), video_gen_id });
+  log.info('[Vidu] raw response', {
+    status: res.status,
+    body_chars: raw.length,
+    body_preview: raw.slice(0, 1200),
+    video_gen_id,
+  });
 
   if (!res.ok) {
     let errMsg = 'Vidu request failed: ' + res.status;
@@ -1616,7 +2201,16 @@ async function callViduVideoApi(config, log, opts) {
     log.error('[Vidu] no task_id in response', { video_gen_id, raw: raw.slice(0, 300) });
     return { error: 'Vidu no task_id returned' };
   }
-  log.info('[Vidu] task created', { task_id: taskId, state: data?.state, video_gen_id });
+  log.info('[Vidu] task created', {
+    task_id: taskId,
+    state: data?.state,
+    video_gen_id,
+    response_model: data?.model,
+    response_aspect_ratio: data?.aspect_ratio,
+    response_duration: data?.duration,
+    response_resolution: data?.resolution,
+    credits: data?.credits,
+  });
   return { task_id: taskId, status: data?.state || 'created' };
 }
 
@@ -1627,9 +2221,6 @@ async function callViduVideoApi(config, log, opts) {
 async function resolveVeo3ImageForApi(rawImgUrl, storage_local_path, log, video_gen_id) {
   const raw = (rawImgUrl || '').trim();
   if (!raw) return null;
-  if (raw.startsWith('asset://')) {
-    return { kind: 'url', value: raw };
-  }
   const tag = `videoref_${video_gen_id || '0'}`;
   try {
     const host = new URL(raw).hostname.toLowerCase();
@@ -1749,9 +2340,9 @@ async function callVeo3VideoApi(config, log, opts) {
     url, model,
     has_image: !!body.images,
     prompt_len: (prompt || '').length,
-    prompt_head: (prompt || '').slice(0, 200),
     video_gen_id,
   });
+  logVideoPostRequest(log, 'Veo3', url, body, video_gen_id, { model });
 
   const res = await fetch(url, {
     method: 'POST',
@@ -1795,6 +2386,410 @@ async function callVeo3VideoApi(config, log, opts) {
 
   log.error('[Veo3] cannot parse task_id or video_url', { data: JSON.stringify(data).slice(0, 500), video_gen_id });
   return { error: 'Veo3 no task_id or video_url: ' + JSON.stringify(data).slice(0, 300) };
+}
+
+/** Agnes Video V2.0：POST /videos JSON，轮询 GET /videos/{task_id} */
+const AGNES_ALLOWED_NUM_FRAMES = [81, 121, 161, 241, 441];
+const AGNES_VIDEO_25_RATIO_VALUES = [
+  ['21:9', 21 / 9],
+  ['16:9', 16 / 9],
+  ['4:3', 4 / 3],
+  ['1:1', 1],
+  ['3:4', 3 / 4],
+  ['9:16', 9 / 16],
+];
+
+function normalizeAgnesVideo25Duration(duration) {
+  const n = Math.round(Number(duration) || 5);
+  if (!Number.isFinite(n)) return '5';
+  return String(Math.min(12, Math.max(4, n)));
+}
+
+function normalizeAgnesVideo25AspectRatio(ratio) {
+  const normalized = normalizeAspectRatioForApi(ratio);
+  const allowed = new Set(AGNES_VIDEO_25_RATIO_VALUES.map(([label]) => label));
+  if (normalized && allowed.has(normalized)) return normalized;
+  const raw = String(ratio || '').trim().replace(/\uFF1A/g, ':').replace(/[×xX＊*]/g, ':');
+  if (allowed.has(raw)) return raw;
+  // 2:3 / 3:2 等映射到最接近的 2.5 支持画幅
+  const match = raw.match(/^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$/);
+  if (match) {
+    const r = Number(match[1]) / Number(match[2]);
+    let best = '16:9';
+    let bestD = Infinity;
+    for (const [label, tr] of AGNES_VIDEO_25_RATIO_VALUES) {
+      const d = Math.abs(Math.log(r) - Math.log(tr));
+      if (d < bestD) {
+        bestD = d;
+        best = label;
+      }
+    }
+    return best;
+  }
+  return '16:9';
+}
+
+function normalizeAgnesVideo25Size(model, resolution) {
+  if (isAgnesVideo25FlashModel(model)) return '720P';
+  const r = String(resolution || '').toUpperCase();
+  if (/2K|1080|1440|2160|4K/.test(r)) return '2K';
+  return '720P';
+}
+
+/**
+ * Agnes Video 2.5 / 2.5 Flash：OpenAI Videos 兼容参数（mode / seconds / size / aspect_ratio）
+ */
+function buildAgnesVideo25Body({
+  model,
+  prompt,
+  duration,
+  aspect_ratio,
+  resolution,
+  useOmniReference,
+  resolvedRefs,
+  firstResolved,
+  lastResolved,
+}) {
+  const flash = isAgnesVideo25FlashModel(model);
+  const body = {
+    model: model || 'agnes-video-2.5-flash',
+    prompt: prompt || '',
+    seconds: normalizeAgnesVideo25Duration(duration),
+    size: normalizeAgnesVideo25Size(model, resolution),
+    aspect_ratio: normalizeAgnesVideo25AspectRatio(aspect_ratio),
+  };
+  const refs = Array.isArray(resolvedRefs) ? resolvedRefs.filter(Boolean) : [];
+  if (useOmniReference && refs.length) {
+    const maxImages = flash ? 5 : 9;
+    body.mode = 'reference';
+    body.images = refs.slice(0, maxImages);
+    return {
+      body,
+      strategy: refs.length > 1 ? 'v25_reference' : 'v25_reference_single',
+    };
+  }
+  if (firstResolved || lastResolved) {
+    body.mode = 'keyframe';
+    if (firstResolved) body.first_frame = firstResolved;
+    if (lastResolved && lastResolved !== firstResolved) body.last_frame = lastResolved;
+    return { body, strategy: 'v25_keyframe' };
+  }
+  body.mode = 'text';
+  return { body, strategy: 'v25_text' };
+}
+
+/** 调试日志：base64 只记长度，http(s) URL 保留完整以便核对参考图 */
+function summarizeMediaValueForLog(value) {
+  if (value == null) return value;
+  const s = String(value);
+  if (s.startsWith('data:')) return `(base64, ${s.length} chars)`;
+  return s;
+}
+
+/** 格式化视频 POST JSON 请求体，便于日志排查参考图/关键帧策略 */
+function formatVideoPostBodyForLog(body) {
+  if (!body || typeof body !== 'object') return body;
+  const clone = JSON.parse(JSON.stringify(body));
+
+  if (Array.isArray(clone.extra_body?.image)) {
+    clone.extra_body.image = clone.extra_body.image.map((url, i) => `[${i}] ${summarizeMediaValueForLog(url)}`);
+  }
+  if (typeof clone.image === 'string') {
+    clone.image = summarizeMediaValueForLog(clone.image);
+  }
+  if (clone.image && typeof clone.image === 'object' && clone.image.url) {
+    clone.image = { ...clone.image, url: summarizeMediaValueForLog(clone.image.url) };
+  }
+  if (typeof clone.first_frame === 'string') {
+    clone.first_frame = summarizeMediaValueForLog(clone.first_frame);
+  }
+  if (typeof clone.last_frame === 'string') {
+    clone.last_frame = summarizeMediaValueForLog(clone.last_frame);
+  }
+  if (Array.isArray(clone.images)) {
+    clone.images = clone.images.map((u, i) => `[${i}] ${summarizeMediaValueForLog(u)}`);
+  }
+  if (Array.isArray(clone.image_list)) {
+    clone.image_list = clone.image_list.map((item, i) => {
+      const out = { ...item, index: i };
+      if (out.url) out.url = summarizeMediaValueForLog(out.url);
+      if (out.image) out.image = summarizeMediaValueForLog(out.image);
+      if (out.image_url) out.image_url = summarizeMediaValueForLog(out.image_url);
+      return out;
+    });
+  }
+  if (Array.isArray(clone.content)) {
+    clone.content = clone.content.map((part) => {
+      if (part?.type === 'image_url' && part.image_url?.url) {
+        return {
+          ...part,
+          image_url: { ...part.image_url, url: summarizeMediaValueForLog(part.image_url.url) },
+        };
+      }
+      if (part?.image_url && typeof part.image_url === 'string') {
+        return { ...part, image_url: summarizeMediaValueForLog(part.image_url) };
+      }
+      return part;
+    });
+  }
+  return clone;
+}
+
+function logVideoPostRequest(log, provider, url, body, video_gen_id, meta = {}) {
+  const formatted = formatVideoPostBodyForLog(body);
+  log.info(`[${provider}] Video POST 摘要`, { video_gen_id, url, ...meta });
+  log.info(`[${provider}] Video POST 请求体`, {
+    video_gen_id,
+    post_body: JSON.stringify(formatted, null, 2),
+  });
+}
+
+function agnesDimensionsFromAspectRatio(ratio) {
+  const map = {
+    '16:9': { width: 1152, height: 768 },
+    '9:16': { width: 768, height: 1152 },
+    '4:3': { width: 1024, height: 768 },
+    '3:4': { width: 768, height: 1024 },
+    '1:1': { width: 768, height: 768 },
+    '21:9': { width: 1344, height: 576 },
+  };
+  return map[ratio] || map['16:9'];
+}
+
+function agnesSnapNumFrames(durationSec, frameRate = 24) {
+  const target = Math.round((Number(durationSec) || 5) * frameRate);
+  let best = AGNES_ALLOWED_NUM_FRAMES[0];
+  for (const v of AGNES_ALLOWED_NUM_FRAMES) {
+    if (Math.abs(v - target) < Math.abs(best - target)) best = v;
+  }
+  return best;
+}
+
+/**
+ * Agnes 视频入参图片策略（可单测）：
+ * - 顶层 image 仅支持 string（服务端 Go 结构体不接受 array）
+ * - 全能多图参考：extra_body.image 数组，且禁止 mode: keyframes
+ * - 经典首尾帧：extra_body.mode = keyframes + 恰好两张图
+ */
+function buildAgnesVideoImagePayload({ useOmniReference, resolvedRefs, firstResolved, lastResolved }) {
+  const refs = Array.isArray(resolvedRefs) ? resolvedRefs.filter(Boolean) : [];
+  if (useOmniReference && refs.length >= 2) {
+    return {
+      strategy: 'omni_reference_extra_body',
+      extra_body: { image: refs.slice(0, 10) },
+    };
+  }
+  if (useOmniReference && refs.length === 1) {
+    return {
+      strategy: 'omni_reference_single',
+      image: refs[0],
+    };
+  }
+  if (!useOmniReference && firstResolved && lastResolved && firstResolved !== lastResolved) {
+    return {
+      strategy: 'classic_keyframes',
+      extra_body: { mode: 'keyframes', image: [firstResolved, lastResolved] },
+    };
+  }
+  if (firstResolved) {
+    return {
+      strategy: 'classic_i2v',
+      image: firstResolved,
+    };
+  }
+  return { strategy: 'text_only' };
+}
+
+async function callAgnesVideoApi(db, config, log, opts) {
+  const {
+    prompt,
+    model,
+    duration,
+    aspect_ratio,
+    resolution,
+    image_url,
+    first_frame_url,
+    last_frame_url,
+    reference_urls,
+    files_base_url,
+    storage_local_path,
+    video_gen_id,
+  } = opts;
+
+  const base = (config.base_url || 'https://apihub.agnes-ai.com/v1').replace(/\/$/, '');
+  let ep = config.endpoint || '/videos';
+  if (!ep.startsWith('/')) ep = '/' + ep;
+  const url = base + ep;
+  const use25 = isAgnesVideo25Model(model);
+
+  const rawRefList = Array.isArray(reference_urls) ? reference_urls.filter(Boolean) : [];
+  const resolvedRefs = [];
+  const seen = new Set();
+  for (let i = 0; i < rawRefList.length; i++) {
+    const r = await resolveImageInputForAgnesAsync(
+      db,
+      rawRefList[i],
+      files_base_url,
+      storage_local_path,
+      log,
+      video_gen_id,
+      `ref_${i}`
+    );
+    if (r && !seen.has(r)) {
+      seen.add(r);
+      resolvedRefs.push(r);
+    }
+  }
+
+  const rawFirst = (first_frame_url || image_url || '').toString().trim();
+  const rawLast = (last_frame_url || '').toString().trim();
+  const useOmniReference = rawRefList.length > 0;
+
+  let firstResolved = null;
+  let lastResolved = null;
+  if (!useOmniReference) {
+    firstResolved = rawFirst
+      ? await resolveImageInputForAgnesAsync(db, rawFirst, files_base_url, storage_local_path, log, video_gen_id, 'first_frame')
+      : null;
+    lastResolved = rawLast
+      ? await resolveImageInputForAgnesAsync(db, rawLast, files_base_url, storage_local_path, log, video_gen_id, 'last_frame')
+      : null;
+  }
+
+  if (rawRefList.length > 0 && resolvedRefs.length === 0) {
+    return {
+      error: 'Agnes 视频参考图须为公网 URL，本地图上传图床失败（imageproxy.zhongzhuan.chat 可能无法访问）。请检查网络/代理，或将 storage.base_url 配置为 Agnes 可访问的公网地址后重试。',
+    };
+  }
+
+  let body;
+  let imageStrategy;
+  if (use25) {
+    const built = buildAgnesVideo25Body({
+      model,
+      prompt,
+      duration,
+      aspect_ratio,
+      resolution,
+      useOmniReference,
+      resolvedRefs,
+      firstResolved,
+      lastResolved,
+    });
+    body = built.body;
+    imageStrategy = built.strategy;
+  } else {
+    const frameRate = 24;
+    const dims = agnesDimensionsFromAspectRatio(aspect_ratio || '16:9');
+    const numFrames = agnesSnapNumFrames(duration, frameRate);
+    body = {
+      model: model || 'agnes-video-v2.0',
+      prompt: prompt || '',
+      width: dims.width,
+      height: dims.height,
+      num_frames: numFrames,
+      frame_rate: frameRate,
+    };
+    const imagePayload = buildAgnesVideoImagePayload({
+      useOmniReference,
+      resolvedRefs,
+      firstResolved,
+      lastResolved,
+    });
+    imageStrategy = imagePayload.strategy;
+    if (imagePayload.image != null) body.image = imagePayload.image;
+    if (imagePayload.extra_body) body.extra_body = imagePayload.extra_body;
+  }
+
+  log.info('[Agnes] 参考图输入（解析前）', {
+    video_gen_id,
+    use_omni_reference: useOmniReference,
+    use_video_25: use25,
+    raw_ref_count: rawRefList.length,
+    raw_refs: rawRefList.map((u, i) => ({ index: i, url: String(u) })),
+    raw_first_frame: rawFirst || null,
+    raw_last_frame: rawLast || null,
+  });
+  log.info('[Agnes] 参考图解析结果', {
+    video_gen_id,
+    resolved_ref_count: resolvedRefs.length,
+    resolved_refs: resolvedRefs.map((u, i) => ({ index: i, url: u })),
+    first_resolved: firstResolved,
+    last_resolved: lastResolved,
+    image_strategy: imageStrategy,
+  });
+
+  logVideoPostRequest(log, 'Agnes', url, body, video_gen_id, {
+    model: body.model,
+    use_video_25: use25,
+    mode: body.mode || null,
+    seconds: body.seconds || null,
+    size: body.size || null,
+    width: body.width,
+    height: body.height,
+    num_frames: body.num_frames,
+    frame_rate: body.frame_rate,
+    duration_sec: duration,
+    aspect_ratio: body.aspect_ratio || aspect_ratio || '16:9',
+    image_strategy: imageStrategy,
+    extra_body_mode: body.extra_body?.mode || null,
+    omni_reference: useOmniReference,
+    prompt_len: (body.prompt || '').length,
+  });
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + (config.api_key || ''),
+    },
+    body: JSON.stringify(body),
+  });
+  const raw = await res.text();
+  log.info('[Agnes] raw response', { status: res.status, raw: raw.slice(0, 1000), video_gen_id });
+
+  if (!res.ok) {
+    let errMsg = 'Agnes 视频请求失败: ' + res.status;
+    try {
+      const errJson = JSON.parse(raw);
+      const msg = errJson.error?.message || errJson.detail || errJson.message || errJson.error;
+      if (msg) errMsg += ' - ' + (typeof msg === 'string' ? msg : JSON.stringify(msg).slice(0, 200));
+    } catch (_) {
+      if (raw) errMsg += ' - ' + raw.slice(0, 200);
+    }
+    return { error: errMsg };
+  }
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    return { error: 'Agnes 响应解析失败: ' + e.message + ' | raw: ' + raw.slice(0, 200) };
+  }
+
+  const directUrl = extractAgnesVideoUrl(data);
+  if (directUrl) {
+    log.info('[Agnes] 直接返回 video_url', { video_url: directUrl, video_gen_id });
+    return { video_url: directUrl };
+  }
+
+  // Video 2.5 轮询必须用 video_id；V2.0 用 id/task_id
+  const taskId = use25
+    ? (data.video_id || data.id || data.task_id || data.data?.video_id || data.data?.id || data.data?.task_id)
+    : (data.id || data.task_id || data.video_id || data.data?.id || data.data?.task_id);
+  if (taskId) {
+    log.info('[Agnes] 返回 task_id', {
+      task_id: taskId,
+      video_id: data.video_id || null,
+      status: data.status,
+      video_gen_id,
+      use_video_25: use25,
+    });
+    return { task_id: String(taskId), status: data.status || 'processing' };
+  }
+
+  log.error('[Agnes] 无 task_id 或 video_url', { data: JSON.stringify(data).slice(0, 500), video_gen_id });
+  return { error: 'Agnes 未返回 task_id 或 video_url: ' + JSON.stringify(data).slice(0, 300) };
 }
 
 /**
@@ -1945,9 +2940,17 @@ async function callSoraVideoApi(config, log, opts) {
   log.info('[Sora] Video API request', {
     url, model, size, seconds: dur,
     has_image: !!imageBuffer, image_file: imageBuffer ? imageFilename : null,
-    prompt_len: (prompt || '').length,
-    prompt_head: (prompt || '').slice(0, 200),
     video_gen_id,
+  });
+  log.info('[Sora] Video POST 请求体 (multipart)', {
+    video_gen_id,
+    post_body: JSON.stringify({
+      model,
+      prompt,
+      seconds: dur,
+      size,
+      input_reference: imageBuffer ? { filename: imageFilename, mime: imageMime, bytes: imageBuffer.length } : null,
+    }, null, 2),
   });
 
   const res = await fetch(url, {
@@ -2407,346 +3410,400 @@ async function callXaiVideoApi(config, log, opts) {
   return { error: 'xAI 未返回 request_id 或视频地址: ' + JSON.stringify(data).slice(0, 300) };
 }
 
-/** 支持将角色主图 URL 替换为 seedance2_asset.asset_url（asset://…）的视频协议 */
 const VIDEO_PROTOCOLS_SUPPORT_SD2_ASSET_SCHEME = new Set([
   'volcengine_omni',
   'volcengine',
   'dashscope',
   'kling_omni',
   'kling',
-  'xai',
-  'veo3',
-  'vidu',
-  'openai',
 ]);
 
-function parseJsonColumnForVideo(val) {
-  if (val == null || val === '') return null;
-  if (typeof val === 'object' && !Array.isArray(val)) return val;
-  if (typeof val !== 'string') return null;
+function parseJsonColumnForVideo(v) {
+  if (v == null || v === '') return null;
   try {
-    return JSON.parse(val);
+    return typeof v === 'string' ? JSON.parse(v) : v;
   } catch (_) {
     return null;
   }
 }
 
-/** 与 Seedance2 / 素材库约定一致：image_url.url = asset://asset-… */
 function normalizeMaterialHubAssetUrlForVideo(assetUrlOrId) {
   const s = String(assetUrlOrId || '').trim();
   if (!s) return null;
   if (s.startsWith('asset://')) return s;
-  if (s.startsWith('http://') || s.startsWith('https://')) return s;
   if (s.startsWith('asset-')) return `asset://${s}`;
   return `asset://${s.replace(/^\/+/, '')}`;
 }
 
-/** 与 storage local_path 对齐的相对路径（无首尾 /，无 query） */
 function normalizeStorageRelativePath(p) {
   let s = String(p || '').trim().replace(/^[/\\]+/, '').split('?')[0];
   s = s.replace(/\\/g, '/').replace(/\/+$/, '');
   return s;
 }
 
-/**
- * pathname 片段常为百分号编码（中文目录），DB 里 local_path 多为解码后的明文，需对齐后再做 Map 查找。
- */
-function decodeUriPathForSd2Match(pathRaw) {
-  const raw = String(pathRaw || '').trim();
-  if (!raw) return '';
-  try {
-    return decodeURIComponent(raw);
-  } catch (_) {
-    try {
-      return raw
-        .split('/')
-        .map((seg) => {
-          if (!seg) return seg;
-          try {
-            return decodeURIComponent(seg);
-          } catch {
-            return seg;
-          }
-        })
-        .join('/');
-    } catch {
-      return raw;
-    }
-  }
-}
-
-/**
- * 从公网/本机静态 URL 抽出与 characters.local_path 一致的相对路径。
- * 约定：pathname 中含 `/static/` 时取其后的片段（忽略 host/port，解决 base_url 与 reference_urls 端口不一致）。
- */
 function storageRelativeFromPublicUrl(urlStr) {
   const s = String(urlStr || '').trim();
   if (!/^https?:\/\//i.test(s)) return '';
   try {
     const u = new URL(s);
     let p = u.pathname || '';
-    const lower = p.toLowerCase();
     const marker = '/static/';
-    const idx = lower.indexOf(marker);
+    const idx = p.toLowerCase().indexOf(marker);
     if (idx >= 0) p = p.slice(idx + marker.length);
     else p = p.replace(/^\/+/, '');
-    p = decodeUriPathForSd2Match(p);
-    return normalizeStorageRelativePath(p);
+    return normalizeStorageRelativePath(decodeURIComponent(p));
   } catch (_) {
     return '';
   }
 }
 
-function emptySd2Lookup() {
-  return { urlToAsset: new Map(), relPathToAsset: new Map() };
-}
-
-function sd2LookupIsEmpty(lookup) {
-  if (!lookup || !lookup.urlToAsset) return true;
-  return (lookup.urlToAsset.size || 0) === 0 && (lookup.relPathToAsset?.size || 0) === 0;
-}
-
-function sd2CandidateUrlKeysForCharacter(row, filesBaseUrl) {
-  const keys = new Set();
-  const base = (filesBaseUrl || '').toString().trim().replace(/\/$/, '');
-  const pushKey = (u) => {
-    const s = String(u || '').trim();
-    if (!s || s.startsWith('data:')) return;
-    keys.add(s);
-    keys.add(s.split('?')[0]);
-    keys.add(s.replace(/\/+$/, ''));
-    keys.add(s.split('?')[0].replace(/\/+$/, ''));
-  };
-  const img = (row.image_url || '').trim();
-  const lp = (row.local_path || '').trim().replace(/^\/+/, '');
-  if (img) pushKey(img);
-  if (img && img.startsWith('/') && base) pushKey(`${base}${img}`);
-  if (lp && base) pushKey(`${base}/${lp}`);
-  return keys;
-}
-
-/**
- * 限制 SD2 素材替换仅作用于「本分镜/本集」相关角色，避免参考图 URL 偶然命中剧中其他已认证角色仍被改成 asset://。
- * - 优先 storyboards.characters（非空数组则只用其中 id）
- * - 若未配置或解析失败：用该分镜所属集的 episode_characters
- * - 若仍无法得到列表：返回 null，表示不限制（兼容旧数据）
- * - characters 存合法 JSON 空数组 []：返回 []，表示本分镜不关联任何剧内角色，不做任何 asset 替换
- */
-function resolveSd2RestrictCharacterIds(db, storyboardId) {
-  if (!db || !storyboardId) return null;
-  let sb;
-  try {
-    sb = db
-      .prepare('SELECT characters, episode_id FROM storyboards WHERE id = ? AND deleted_at IS NULL')
-      .get(Number(storyboardId));
-  } catch (_) {
-    return null;
-  }
-  if (!sb) return null;
-  const raw = sb.characters;
-  if (raw != null && String(raw).trim() !== '') {
-    try {
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      if (Array.isArray(parsed)) {
-        const ids = [];
-        for (const item of parsed) {
-          const cid = typeof item === 'object' && item != null ? item.id : item;
-          const n = Number(cid);
-          if (Number.isFinite(n) && n > 0) ids.push(n);
-        }
-        if (ids.length > 0) return [...new Set(ids)];
-        if (parsed.length === 0) return [];
-      }
-    } catch (_) {
-      /* fall through to episode */
-    }
-  }
-  if (sb.episode_id != null) {
-    try {
-      const rows = db.prepare('SELECT character_id FROM episode_characters WHERE episode_id = ?').all(Number(sb.episode_id));
-      const ids = [...new Set((rows || []).map((r) => Number(r.character_id)).filter((n) => Number.isFinite(n) && n > 0))];
-      if (ids.length > 0) return ids;
-    } catch (_) {
-      return null;
-    }
-  }
-  return null;
-}
-
-function buildSd2ActiveAssetUrlLookup(db, dramaId, filesBaseUrl, restrictCharacterIds) {
+function buildSd2ActiveAssetUrlLookup(db, dramaId) {
   const urlToAsset = new Map();
   const relPathToAsset = new Map();
   if (!db || !dramaId) return { urlToAsset, relPathToAsset };
-  if (Array.isArray(restrictCharacterIds) && restrictCharacterIds.length === 0) {
-    return { urlToAsset, relPathToAsset };
-  }
-  let rows;
+  let rows = [];
   try {
-    let sql =
-      'SELECT image_url, local_path, seedance2_asset FROM characters WHERE drama_id = ? AND deleted_at IS NULL';
-    const params = [Number(dramaId)];
-    if (Array.isArray(restrictCharacterIds) && restrictCharacterIds.length > 0) {
-      const uniq = [...new Set(restrictCharacterIds.map((x) => Number(x)).filter((n) => Number.isFinite(n) && n > 0))];
-      if (uniq.length === 0) return { urlToAsset, relPathToAsset };
-      sql += ` AND id IN (${uniq.map(() => '?').join(',')})`;
-      params.push(...uniq);
-    }
-    rows = db.prepare(sql).all(...params);
+    rows = db.prepare(
+      'SELECT image_url, local_path, seedance2_asset FROM characters WHERE drama_id = ? AND deleted_at IS NULL'
+    ).all(Number(dramaId));
   } catch (_) {
     return { urlToAsset, relPathToAsset };
   }
-  for (const row of rows || []) {
+  for (const row of rows) {
     const asset = parseJsonColumnForVideo(row.seedance2_asset);
     if (!asset || String(asset.status || '').toLowerCase() !== 'active') continue;
-    const uri = normalizeMaterialHubAssetUrlForVideo(asset.asset_url || asset.hub_asset_id);
+    const uri = normalizeMaterialHubAssetUrlForVideo(asset.hub_asset_id || asset.asset_url);
     if (!uri) continue;
-    const certLpRaw = (asset.certified_local_path != null && String(asset.certified_local_path).trim())
-      ? String(asset.certified_local_path).trim()
-      : '';
-    const certLp = certLpRaw ? normalizeStorageRelativePath(certLpRaw) : '';
-    const certImg = (asset.certified_image_url != null && String(asset.certified_image_url).trim())
-      ? String(asset.certified_image_url).trim()
-      : '';
-    if (certLp || certImg) {
-      const certRow = { image_url: certImg, local_path: certLp };
-      for (const k of sd2CandidateUrlKeysForCharacter(certRow, filesBaseUrl)) {
-        urlToAsset.set(k, uri);
-      }
-      if (certLp) relPathToAsset.set(certLp, uri);
-      if (certImg && /^https?:\/\//i.test(certImg)) {
-        const relFromCertImg = storageRelativeFromPublicUrl(certImg);
-        if (relFromCertImg) relPathToAsset.set(relFromCertImg, uri);
-      }
-      continue;
+    const certImg = String(asset.certified_image_url || '').trim();
+    const certLp = normalizeStorageRelativePath(asset.certified_local_path || '');
+    if (certImg) {
+      urlToAsset.set(certImg, uri);
+      urlToAsset.set(certImg.split('?')[0], uri);
     }
-    for (const k of sd2CandidateUrlKeysForCharacter(row, filesBaseUrl)) {
-      urlToAsset.set(k, uri);
+    if (certLp) relPathToAsset.set(certLp, uri);
+    const img = String(row.image_url || '').trim();
+    if (img) {
+      urlToAsset.set(img, uri);
+      urlToAsset.set(img.split('?')[0], uri);
     }
-    const lp = (row.local_path || '').trim().replace(/^\/+/, '');
-    if (lp) {
-      const nr = normalizeStorageRelativePath(lp);
-      if (nr) relPathToAsset.set(nr, uri);
-    }
-    const img = (row.image_url || '').trim();
-    if (img && /^https?:\/\//i.test(img)) {
-      const relFromImg = storageRelativeFromPublicUrl(img);
-      if (relFromImg) relPathToAsset.set(relFromImg, uri);
-    }
+    const lp = normalizeStorageRelativePath(row.local_path || '');
+    if (lp) relPathToAsset.set(lp, uri);
   }
   return { urlToAsset, relPathToAsset };
 }
 
 function rewriteOneImageUrlForSd2(original, lookup) {
   const s = String(original || '').trim();
-  if (!s || s.startsWith('asset://') || s.startsWith('data:')) return { next: s, changed: false, via: null };
-  const urlMap = lookup.urlToAsset;
-  const relMap = lookup.relPathToAsset;
-  const tries = [s, s.split('?')[0], s.replace(/\/+$/, ''), s.split('?')[0].replace(/\/+$/, '')];
+  if (!s || s.startsWith('asset://') || s.startsWith('data:')) return { next: s, changed: false };
+  const tries = [s, s.split('?')[0]];
   for (const t of tries) {
-    if (urlMap && urlMap.has(t)) return { next: urlMap.get(t), changed: true, via: 'url_exact' };
+    if (lookup.urlToAsset.has(t)) return { next: lookup.urlToAsset.get(t), changed: true };
   }
-  if (relMap && relMap.size) {
-    const rel = storageRelativeFromPublicUrl(s);
-    if (rel) {
-      const variants = [rel, rel.replace(/\/+$/, '')];
-      for (const rv of variants) {
-        if (rv && relMap.has(rv)) return { next: relMap.get(rv), changed: true, via: 'storage_rel_path' };
-      }
+  const rel = storageRelativeFromPublicUrl(s);
+  if (rel && lookup.relPathToAsset.has(rel)) {
+    return { next: lookup.relPathToAsset.get(rel), changed: true };
+  }
+  return { next: s, changed: false };
+}
+
+/**
+ * 收集剧中所有 active 状态的 Seedance 2.0 角色音色参考
+ * @returns {Map<number, string>} charId -> publicUrl
+ */
+function collectActiveCharacterVoiceRefs(db, dramaId) {
+  const map = new Map();
+  if (!db || !dramaId) return map;
+  try {
+    const rows = db.prepare(
+      'SELECT id, seedance2_voice_asset FROM characters WHERE drama_id = ? AND deleted_at IS NULL'
+    ).all(Number(dramaId));
+    for (const row of rows) {
+      const asset = parseJsonColumnForVideo(row.seedance2_voice_asset);
+      if (!asset || String(asset.status || '').toLowerCase() !== 'active') continue;
+      const url = String(asset.url || '').trim();
+      if (url) map.set(Number(row.id), url);
     }
-  }
-  return { next: s, changed: false, via: null };
+  } catch (_) {}
+  return map;
 }
 
 function applySeedance2CertifiedAssetUrlsToVideoOpts(db, log, opts) {
   const out = { ...opts };
-  const restrictCharIds = resolveSd2RestrictCharacterIds(db, opts.storyboard_id);
-  const lookup = buildSd2ActiveAssetUrlLookup(db, opts.drama_id, opts.files_base_url, restrictCharIds);
-  if (sd2LookupIsEmpty(lookup)) {
-    if (log?.info) {
-      log.info('[视频][SD2认证图] 本剧无 active 角色素材或未配置映射，跳过', {
-        video_gen_id: opts.video_gen_id,
-        drama_id: opts.drama_id,
-        storyboard_id: opts.storyboard_id || null,
-        restrict_character_ids: restrictCharIds === null ? '(未限制)' : restrictCharIds,
-      });
-    }
-    return out;
-  }
-  if (log?.info) {
-    log.info('[视频][SD2认证图] 映射表已构建', {
-      video_gen_id: opts.video_gen_id,
-      drama_id: opts.drama_id,
-      storyboard_id: opts.storyboard_id || null,
-      restrict_character_ids: restrictCharIds === null ? '(未限制)' : restrictCharIds,
-      files_base_url: String(opts.files_base_url || '').slice(0, 200),
-      url_key_count: lookup.urlToAsset.size,
-      rel_key_count: lookup.relPathToAsset.size,
-      url_key_samples: [...lookup.urlToAsset.keys()].slice(0, 5).map((k) => String(k).slice(0, 140)),
-      rel_key_samples: [...lookup.relPathToAsset.keys()].slice(0, 8).map((k) => String(k).slice(0, 100)),
-    });
-  }
+  const lookup = buildSd2ActiveAssetUrlLookup(db, opts.drama_id);
+  if (lookup.urlToAsset.size === 0 && lookup.relPathToAsset.size === 0) return out;
   const changes = [];
   const patch = (field, val) => {
-    if (val == null || val === '') return val;
-    const { next, changed, via } = rewriteOneImageUrlForSd2(val, lookup);
-    if (changed) {
-      changes.push({
-        field,
-        via: via || 'unknown',
-        from: String(val).slice(0, 200),
-        to: String(next).slice(0, 160),
-      });
-    }
-    return next;
+    const r = rewriteOneImageUrlForSd2(val, lookup);
+    if (r.changed) changes.push(field);
+    return r.next;
   };
   if (opts.image_url != null) out.image_url = patch('image_url', opts.image_url);
   if (opts.first_frame_url != null) out.first_frame_url = patch('first_frame_url', opts.first_frame_url);
   if (opts.last_frame_url != null) out.last_frame_url = patch('last_frame_url', opts.last_frame_url);
   if (Array.isArray(opts.reference_urls)) {
-    out.reference_urls = opts.reference_urls.map((u, i) => {
-      const { next, changed, via } = rewriteOneImageUrlForSd2(u, lookup);
-      if (changed) {
-        changes.push({
-          field: `reference_urls[${i}]`,
-          via: via || 'unknown',
-          from: String(u).slice(0, 200),
-          to: String(next).slice(0, 160),
-        });
-      }
-      return next;
-    });
+    out.reference_urls = opts.reference_urls.map((u, i) => patch(`reference_urls[${i}]`, u));
   }
   if (changes.length && log?.info) {
-    log.info('[视频][SD2认证图] 已替换为素材库 asset 引用', {
+    log.info('[视频][SD2] 已将认证图片替换为 asset 引用', {
       video_gen_id: opts.video_gen_id,
       drama_id: opts.drama_id,
-      url_key_count: lookup.urlToAsset.size,
-      rel_key_count: lookup.relPathToAsset.size,
-      repl_count: changes.length,
-      repl_detail: changes,
-    });
-  } else if (log?.info) {
-    const refUrls = Array.isArray(opts.reference_urls) ? opts.reference_urls : [];
-    const ref_diag = refUrls.map((u, i) => {
-      const head = String(u || '').slice(0, 140);
-      const extracted = storageRelativeFromPublicUrl(u);
-      const relHit = !!(extracted && lookup.relPathToAsset && lookup.relPathToAsset.has(extracted));
-      return { i, url_head: head, extracted_rel: extracted || null, rel_map_hit: relHit };
-    });
-    log.info('[视频][SD2认证图] 有 active 素材但与请求中 URL 未命中', {
-      video_gen_id: opts.video_gen_id,
-      drama_id: opts.drama_id,
-      url_key_count: lookup.urlToAsset.size,
-      rel_key_count: lookup.relPathToAsset.size,
-      ref_count: refUrls.length,
-      has_image_url: !!(opts.image_url && String(opts.image_url).trim()),
-      image_url_extracted_rel: opts.image_url ? storageRelativeFromPublicUrl(opts.image_url) : null,
-      reference_url_diag: ref_diag,
-      hint:
-        '若 extracted_rel 与 rel_key_samples 中任一条一致但仍未替换，请提 issue；常见未命中是 reference 为场景图非角色主图、或 pathname 不含 /static/ 且与 local_path 不一致。',
+      changed_fields: changes,
     });
   }
   return out;
+}
+
+/**
+ * 火山经典 Seedance（非 omni）路径：本地图片转 base64（或直传公网 URL）。
+ * 同时支持 first_frame / last_frame 专用字段，以及回退到 image_url。
+ */
+function resolveVolcClassicImage(rawUrl, files_base_url, storage_local_path, log, video_gen_id, roleHint) {
+  let u = String(rawUrl || '').trim();
+  if (!u) return null;
+  if (u.startsWith('data:') || u.startsWith('asset://')) return u;
+
+  // 已经是公网 https 且不含 localhost 的，直接返回
+  if (/^https?:\/\//i.test(u) && !/localhost|127\.0\.0\.1/i.test(u)) return u;
+
+  const fb = (files_base_url || '').replace(/\/$/, '');
+  const baseIndicatesLocal = fb && /localhost|127\.0\.0\.1/i.test(fb);
+  const urlIndicatesLocal = /localhost|127\.0\.0\.1/i.test(u);
+
+  if ((baseIndicatesLocal || urlIndicatesLocal) && storage_local_path) {
+    let rel = null;
+    const marker = '/static/';
+    const idx = u.toLowerCase().indexOf(marker);
+    if (idx >= 0) {
+      rel = u.slice(idx + marker.length).replace(/^\//, '').split('?')[0];
+    } else if (fb) {
+      rel = u.replace(fb + '/', '').replace(fb, '').replace(/^\//, '').split('?')[0];
+    } else if (!/^https?:\/\//i.test(u)) {
+      // 纯相对路径（来自 local_path 兜底）
+      rel = u.replace(/^\//, '').split('?')[0];
+    }
+    if (rel) {
+      const filePath = path.join(storage_local_path, rel);
+      try {
+        if (fs.existsSync(filePath)) {
+          const buf = fs.readFileSync(filePath);
+          const ext = path.extname(filePath).toLowerCase();
+          const mime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.bmp': 'image/bmp' }[ext] || 'image/png';
+          const b64 = 'data:' + mime + ';base64,' + buf.toString('base64');
+          if (log && log.info) {
+            log.info('[Volc] 本地首/尾帧已转为 base64 提交', { video_gen_id, role: roleHint, rel: rel.slice(0, 80) });
+          }
+          return b64;
+        }
+      } catch (_) {}
+    }
+  }
+  // 兜底返回原始值（中转或公网会处理）
+  return u;
+}
+
+/** MiniMax 国内/海外根域名：去掉末尾 /v1 /v2，便于拼 V2 路径 */
+function getMinimaxApiRoot(baseUrl) {
+  let root = String(baseUrl || 'https://api.minimaxi.com').trim().replace(/\/$/, '');
+  for (const suf of ['/v2', '/v1']) {
+    if (root.toLowerCase().endsWith(suf)) {
+      root = root.slice(0, -suf.length).replace(/\/$/, '');
+      break;
+    }
+  }
+  return root || 'https://api.minimaxi.com';
+}
+
+function normalizeMinimaxH3Duration(duration) {
+  const n = Math.round(Number(duration));
+  const safe = Number.isFinite(n) && n > 0 ? n : 5;
+  return Math.min(15, Math.max(4, safe));
+}
+
+function normalizeMinimaxH3Resolution(resolution) {
+  const s = String(resolution || '').trim().toLowerCase();
+  if (!s) return '768P';
+  if (s === '2k' || s.includes('2k') || s.includes('1080') || s === '1080p') return '2K';
+  if (s.includes('768') || s === '768p') return '768P';
+  return '768P';
+}
+
+function buildMinimaxH3CreateUrl(config) {
+  const root = getMinimaxApiRoot(config.base_url);
+  let ep = (config.endpoint || '/v2/video_generation').toString().trim();
+  if (!ep.startsWith('/')) ep = '/' + ep;
+  // 用户若误配旧海螺 /video_generation，在 H3 协议下纠正为 V2
+  if (/^\/video_generation\/?$/i.test(ep) || /^\/v1\/video_generation\/?$/i.test(ep)) {
+    ep = '/v2/video_generation';
+  }
+  return root + ep;
+}
+
+function buildMinimaxH3PollUrl(config, taskId) {
+  const root = getMinimaxApiRoot(config.base_url);
+  const id = String(taskId || '').trim();
+  let ep = (config.query_endpoint || '/v2/query/video_generation/{taskId}').toString().trim();
+  if (!ep.startsWith('/')) ep = '/' + ep;
+  if (/query\/video_generation\?task_id=/i.test(ep) || /^\/v1\/query\//i.test(ep)) {
+    ep = '/v2/query/video_generation/{taskId}';
+  }
+  ep = ep
+    .replace(/\{taskId\}/gi, encodeURIComponent(id))
+    .replace(/\{task_id\}/gi, encodeURIComponent(id))
+    .replace(/\{id\}/gi, encodeURIComponent(id));
+  // 兼容仅写目录的配置：/v2/query/video_generation → 追加 /{taskId}
+  if (/\/v2\/query\/video_generation\/?$/i.test(ep) && id) {
+    ep = ep.replace(/\/?$/, '/') + encodeURIComponent(id);
+  }
+  return root + ep;
+}
+
+function extractMinimaxH3VideoUrl(data) {
+  if (!data || typeof data !== 'object') return null;
+  const task = data.task && typeof data.task === 'object' ? data.task : data;
+  const content = task.content && typeof task.content === 'object' ? task.content : null;
+  return (
+    coerceHttpVideoUrl(content?.url) ||
+    coerceHttpVideoUrl(task.video_url) ||
+    coerceHttpVideoUrl(task.url) ||
+    pickProxyVideoUrl(data) ||
+    null
+  );
+}
+
+function extractMinimaxH3TaskStatus(data) {
+  if (!data || typeof data !== 'object') return '';
+  const task = data.task && typeof data.task === 'object' ? data.task : data;
+  const s = task.status || task.state || data.status;
+  return s != null ? String(s).trim().toLowerCase() : '';
+}
+
+/**
+ * MiniMax-H3：POST /v2/video_generation（content[] 多模态），轮询 GET /v2/query/video_generation/{task_id}
+ * @returns {Promise<{ task_id?: string, video_url?: string, error?: string }>}
+ */
+async function callMinimaxH3VideoApi(config, log, opts) {
+  const {
+    prompt,
+    model,
+    duration,
+    aspect_ratio,
+    resolution,
+    image_url,
+    first_frame_url,
+    last_frame_url,
+    reference_urls,
+    files_base_url,
+    storage_local_path,
+    video_gen_id,
+  } = opts || {};
+  const url = buildMinimaxH3CreateUrl(config);
+  const finalModel = isMinimaxH3Model(model) ? 'MiniMax-H3' : model || 'MiniMax-H3';
+  const dur = normalizeMinimaxH3Duration(duration);
+  const res = normalizeMinimaxH3Resolution(resolution);
+  const ratio = normalizeAspectRatioForApi(aspect_ratio) || String(aspect_ratio || '16:9').trim() || '16:9';
+
+  const content = [{ type: 'text', text: String(prompt || '').trim() || 'cinematic scene' }];
+
+  const rawFirst = (first_frame_url || image_url || '').toString().trim();
+  const rawLast = (last_frame_url || '').toString().trim();
+  const firstForApi = resolveVolcClassicImage(
+    rawFirst,
+    files_base_url,
+    storage_local_path,
+    log,
+    video_gen_id,
+    'first_frame'
+  );
+  let lastForApi = null;
+  if (rawLast) {
+    lastForApi = resolveVolcClassicImage(rawLast, files_base_url, storage_local_path, log, video_gen_id, 'last_frame');
+  }
+  if (firstForApi && lastForApi && firstForApi === lastForApi) lastForApi = null;
+
+  const refs = Array.isArray(reference_urls) ? reference_urls.filter(Boolean).map(String) : [];
+  const useFirstLast = !!(firstForApi || lastForApi);
+
+  if (useFirstLast) {
+    if (firstForApi) {
+      content.push({ type: 'image_url', image_url: { url: firstForApi }, role: 'first_frame' });
+    }
+    if (lastForApi) {
+      content.push({ type: 'image_url', image_url: { url: lastForApi }, role: 'last_frame' });
+    }
+  } else if (refs.length) {
+    for (let i = 0; i < Math.min(refs.length, 9); i++) {
+      const refUrl = resolveVolcClassicImage(
+        refs[i],
+        files_base_url,
+        storage_local_path,
+        log,
+        video_gen_id,
+        `reference_${i}`
+      );
+      if (refUrl) {
+        content.push({ type: 'image_url', image_url: { url: refUrl }, role: 'reference_image' });
+      }
+    }
+  }
+
+  const body = {
+    model: finalModel,
+    content,
+    duration: dur,
+    resolution: res,
+  };
+  // 文生视频 ratio 必填且不能 adaptive；有图时官方示例可省略或 adaptive
+  if (!useFirstLast && !refs.length) {
+    body.ratio = ratio === 'adaptive' ? '16:9' : ratio;
+  } else if (useFirstLast) {
+    body.ratio = 'adaptive';
+  }
+
+  logVideoPostRequest(log, 'MiniMaxH3', url, body, video_gen_id, {
+    model: finalModel,
+    has_first_frame: !!firstForApi,
+    has_last_frame: !!lastForApi,
+    reference_count: useFirstLast ? 0 : Math.min(refs.length, 9),
+  });
+
+  const resHttp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + (config.api_key || ''),
+    },
+    body: JSON.stringify(body),
+  });
+  const raw = await resHttp.text();
+  log.info('[MiniMaxH3] raw response', { video_gen_id, status: resHttp.status, raw: raw.slice(0, 1000) });
+  if (!resHttp.ok) {
+    let errMsg = 'MiniMax H3 请求失败: ' + resHttp.status;
+    try {
+      const errJson = JSON.parse(raw);
+      const msg = errJson.error?.message || errJson.message || errJson.base_resp?.status_msg;
+      if (msg) errMsg += ' - ' + (typeof msg === 'string' ? msg : JSON.stringify(msg).slice(0, 200));
+    } catch (_) {
+      if (raw) errMsg += ' - ' + raw.slice(0, 200);
+    }
+    return { error: errMsg };
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    return { error: 'MiniMax H3 响应非 JSON: ' + e.message };
+  }
+  const taskId = data.task_id || data.task?.id || data.id || data.data?.task_id;
+  const directUrl = extractMinimaxH3VideoUrl(data);
+  if (directUrl) {
+    log.info('[MiniMaxH3] 直接返回 video_url', { video_gen_id, video_url: directUrl });
+    return { video_url: directUrl };
+  }
+  if (taskId) {
+    log.info('[MiniMaxH3] 返回 task_id', { video_gen_id, task_id: taskId });
+    return { task_id: String(taskId), status: 'processing' };
+  }
+  return { error: 'MiniMax H3 未返回 task_id: ' + JSON.stringify(data).slice(0, 300) };
 }
 
 /**
@@ -2754,7 +3811,24 @@ function applySeedance2CertifiedAssetUrlsToVideoOpts(db, log, opts) {
  * @returns {Promise<{ task_id?: string, video_url?: string, error?: string }>}
  */
 async function callVideoApi(db, log, opts) {
-  const { prompt, model: preferredModel, duration, aspect_ratio, resolution, seed, camera_fixed, watermark, image_url, video_gen_id } = opts;
+  const {
+    prompt,
+    model: preferredModel,
+    duration,
+    aspect_ratio,
+    resolution,
+    seed,
+    camera_fixed,
+    watermark,
+    image_url,
+    first_frame_url,
+    last_frame_url,
+    first_frame_local_path,
+    last_frame_local_path,
+    files_base_url,
+    storage_local_path,
+    video_gen_id
+  } = opts;
   const config = getDefaultVideoConfig(db, preferredModel);
   if (!config) {
     throw new Error('???????????AI ?????? video ?????????');
@@ -2762,16 +3836,52 @@ async function callVideoApi(db, log, opts) {
   const model = getModelFromConfig(config, preferredModel);
   const provider = (config.provider || '').toLowerCase();
   const protocol = resolveVideoProtocol(config, preferredModel);
-
   if (db && opts.drama_id && VIDEO_PROTOCOLS_SUPPORT_SD2_ASSET_SCHEME.has(protocol)) {
     opts = applySeedance2CertifiedAssetUrlsToVideoOpts(db, log, opts);
-  } else if (db && opts.drama_id && log?.info) {
-    log.info('[视频][SD2认证图] 当前协议不替换为 asset://（避免与 multipart 等不兼容）', {
-      video_gen_id: opts.video_gen_id,
-      protocol,
-    });
   }
 
+  // Seedance 2.0 自动注入角色音色参考（模型为 SD2 家族，或协议为 volcengine_omni；未显式指定 voice_reference_url 时）
+  const isSeedance2 =
+    isSeedance2FamilyModel(model) || protocol === 'volcengine_omni';
+  if (isSeedance2 && db && opts.drama_id && !opts.voice_reference_url) {
+    const voiceMap = collectActiveCharacterVoiceRefs(db, opts.drama_id);
+    if (voiceMap.size > 0) {
+      // 优先使用分镜显式指定的角色（如果有），否则取第一个
+      let chosen = null;
+      if (opts.storyboard_id) {
+        try {
+          const sbRow = db.prepare('SELECT characters FROM storyboards WHERE id = ?').get(opts.storyboard_id);
+          if (sbRow && sbRow.characters) {
+            const charList = typeof sbRow.characters === 'string' ? JSON.parse(sbRow.characters) : sbRow.characters;
+            const ids = Array.isArray(charList) ? charList.map(c => Number(c?.id || c)).filter(Boolean) : [];
+            for (const cid of ids) {
+              if (voiceMap.has(cid)) { chosen = voiceMap.get(cid); break; }
+            }
+          }
+        } catch (_) {}
+      }
+      if (!chosen) {
+        // 取 Map 中的第一个
+        chosen = voiceMap.values().next().value;
+      }
+      if (chosen) {
+        opts.voice_reference_url = chosen;
+        log.info('[视频][SD2][全能] 自动为 Seedance 2.0 注入角色音色参考（来自角色 seedance2_voice_asset）', {
+          video_gen_id,
+          storyboard_id: opts.storyboard_id,
+          voice_ref_url: String(chosen).slice(0, 100)
+        });
+      } else {
+        log.info('[视频][SD2][全能] 检测到活跃音色参考但未匹配到当前分镜角色', {
+          video_gen_id,
+          storyboard_id: opts.storyboard_id,
+          available_voice_char_ids: Array.from(voiceMap.keys())
+        });
+      }
+    } else {
+      log.info('[视频][SD2][全能] Seedance 2.0 模型但本剧暂无 active 音色参考', { video_gen_id, drama_id: opts.drama_id });
+    }
+  }
   log.info('[视频] 路由协议', {
     video_gen_id,
     provider,
@@ -2779,17 +3889,6 @@ async function callVideoApi(db, log, opts) {
     protocol_used: protocol,
     model,
     endpoint: config.endpoint || '(auto)',
-  });
-
-  log.info('[视频] 参考图 URL 摘要（脱敏/截断）', {
-    video_gen_id: opts.video_gen_id,
-    drama_id: opts.drama_id || null,
-    image_url_head: opts.image_url ? String(opts.image_url).slice(0, 120) : null,
-    first_frame_head: opts.first_frame_url ? String(opts.first_frame_url).slice(0, 120) : null,
-    last_frame_head: opts.last_frame_url ? String(opts.last_frame_url).slice(0, 120) : null,
-    reference_preview: Array.isArray(opts.reference_urls)
-      ? opts.reference_urls.map((u) => String(u || '').slice(0, 100))
-      : null,
   });
 
   if (protocol === 'jimeng_ai_api') {
@@ -2856,6 +3955,7 @@ async function callVideoApi(db, log, opts) {
       prompt, model,
       duration: opts.duration,
       aspect_ratio,
+      resolution: opts.resolution,
       image_url: opts.image_url,
       video_gen_id: opts.video_gen_id,
       files_base_url: opts.files_base_url,
@@ -2886,6 +3986,8 @@ async function callVideoApi(db, log, opts) {
       files_base_url: opts.files_base_url,
       storage_local_path: opts.storage_local_path,
       video_gen_id: opts.video_gen_id,
+      // 为将来可灵 Omni 也支持音色参考做准备（当前 Seedance 2.0 不走此分支）
+      voice_reference_url: opts.voice_reference_url,
     });
   }
 
@@ -2904,6 +4006,8 @@ async function callVideoApi(db, log, opts) {
       files_base_url: opts.files_base_url,
       storage_local_path: opts.storage_local_path,
       video_gen_id: opts.video_gen_id,
+      // 关键：把 callVideoApi 里自动注入的 Seedance 2.0 音色参考音频透传下去
+      voice_reference_url: opts.voice_reference_url,
     });
   }
 
@@ -2931,6 +4035,42 @@ async function callVideoApi(db, log, opts) {
     });
   }
 
+  // Agnes Video（api_protocol = 'agnes'）：V2.0 或 2.5 / 2.5 Flash
+  if (protocol === 'agnes') {
+    return callAgnesVideoApi(db, config, log, {
+      prompt,
+      model,
+      duration: opts.duration,
+      aspect_ratio,
+      resolution: opts.resolution,
+      image_url: opts.image_url,
+      first_frame_url: opts.first_frame_url,
+      last_frame_url: opts.last_frame_url,
+      reference_urls: opts.reference_urls,
+      files_base_url: opts.files_base_url,
+      storage_local_path: opts.storage_local_path,
+      video_gen_id: opts.video_gen_id,
+    });
+  }
+
+  // MiniMax H3 Video Generation V2
+  if (protocol === 'minimax_h3') {
+    return callMinimaxH3VideoApi(config, log, {
+      prompt,
+      model,
+      duration: opts.duration,
+      aspect_ratio,
+      resolution: opts.resolution,
+      image_url: opts.image_url,
+      first_frame_url: opts.first_frame_url,
+      last_frame_url: opts.last_frame_url,
+      reference_urls: opts.reference_urls,
+      files_base_url: opts.files_base_url,
+      storage_local_path: opts.storage_local_path,
+      video_gen_id: opts.video_gen_id,
+    });
+  }
+
   const url = buildVideoUrl(config);
   const dur = duration ? Number(duration) : 5;
   const ratio = aspect_ratio || '16:9';
@@ -2938,43 +4078,41 @@ async function callVideoApi(db, log, opts) {
   const isVolc = protocol === 'volcengine';
   // ???? model ???????????? API ?? ID?
   const finalModel = isVolc ? normalizeVolcModel(model) : model;
-  const hasImage = !!(image_url && image_url.trim());
-  // ?????doubao-seedance-1-5-pro ??? r2v?????? task_type???? i2v ??? reference_image ?????? r2v
-  const volcTaskType = isVolc ? (hasImage ? 'i2v' : 't2v') : null;
 
-  // 针对火山引擎 (Doubao) 修正 duration：只支持 5 或 10 秒
-  // 若传入非标准值（如 3, 4, 8 等），自动吸附到最近的有效值
-  let effectiveDuration = dur;
-  if (isVolc) {
-    if (effectiveDuration <= 7) effectiveDuration = 5;
-    else effectiveDuration = 10;
-    if (effectiveDuration !== dur) {
-      log.info('Adjusted duration for Volcengine', { original: dur, adjusted: effectiveDuration, video_gen_id });
-    }
+  // ========== 首尾帧支持（完善版） ==========
+  // 优先使用显式传入的 first_frame_url / last_frame_url（首尾帧模式核心）
+  // 其次回退到 image_url（经典单图模式保持兼容）
+  const rawFirst = (first_frame_url || first_frame_local_path || image_url || '').toString().trim();
+  const rawLast = (last_frame_url || last_frame_local_path || '').toString().trim();
+
+  // 使用新 helper 解析（自动处理 localhost → base64、asset:// 直传、公网 URL）
+  const firstForApi = resolveVolcClassicImage(rawFirst, files_base_url || opts.files_base_url, storage_local_path || opts.storage_local_path, log, video_gen_id, 'first_frame');
+  let lastForApi = null;
+  if (rawLast) {
+    lastForApi = resolveVolcClassicImage(rawLast, files_base_url || opts.files_base_url, storage_local_path || opts.storage_local_path, log, video_gen_id, 'last_frame');
   }
 
-  // ???? localhost URL????????????? base64?? DashScope ???
-  let imageUrlForApi = image_url && image_url.trim();
-  if (
-    hasImage &&
-    imageUrlForApi &&
-    !String(imageUrlForApi).startsWith('asset://') &&
-    (opts.files_base_url || '').match(/localhost|127\.0\.0\.1/i) &&
-    opts.storage_local_path
-  ) {
-    const baseUrl = (opts.files_base_url || '').replace(/\/$/, '');
-    const afterStatic = imageUrlForApi.split('/static/')[1] || (baseUrl ? imageUrlForApi.replace(baseUrl + '/', '').replace(baseUrl, '') : null);
-    const relPath = afterStatic ? afterStatic.replace(/^\//, '') : null;
-    if (relPath) {
-      const filePath = path.join(opts.storage_local_path, relPath);
-      try {
-        if (fs.existsSync(filePath)) {
-          const buf = fs.readFileSync(filePath);
-          const ext = path.extname(filePath).toLowerCase();
-          const mime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.bmp': 'image/bmp' }[ext] || 'image/png';
-          imageUrlForApi = 'data:' + mime + ';base64,' + buf.toString('base64');
-        }
-      } catch (_) {}
+  // 去重：如果 first 和 last 指向同一资源，只保留 first（极少见）
+  if (firstForApi && lastForApi && firstForApi === lastForApi) {
+    lastForApi = null;
+  }
+
+  const hasAnyFrame = !!(firstForApi || lastForApi);
+  // 只要有首帧或尾帧就走 i2v；旧版单图行为完全保留
+  const volcTaskType = isVolc ? (hasAnyFrame ? 'i2v' : 't2v') : null;
+
+  // 火山 Seedance：按模型版本限制时长（1.5 Pro 支持 5–12 秒，非仅 5/10）
+  let effectiveDuration = dur;
+  if (isVolc) {
+    const rounded = Math.round(dur);
+    effectiveDuration = normalizeVolcengineDuration(finalModel, rounded);
+    if (effectiveDuration !== rounded) {
+      log.info('Adjusted duration for Volcengine', {
+        original: dur,
+        adjusted: effectiveDuration,
+        model: finalModel,
+        video_gen_id,
+      });
     }
   }
 
@@ -2983,6 +4121,7 @@ async function callVideoApi(db, log, opts) {
     model: finalModel,
     content: [{ type: 'text', text: prompt || '' }],
     ratio,
+    aspect_ratio: ratio,
     duration: effectiveDuration,
     watermark: (watermark != null) ? Boolean(watermark) : false,
   };
@@ -2990,18 +4129,47 @@ async function callVideoApi(db, log, opts) {
   if (seed != null) body.seed = Number(seed);
   if (camera_fixed != null) body.camera_fixed = Boolean(camera_fixed);
   if (volcTaskType) body.task_type = volcTaskType;
-  if (hasImage && imageUrlForApi) {
-    const imagePart = { type: 'image_url', image_url: { url: imageUrlForApi } };
-    imagePart.role = volcTaskType === 'i2v' ? 'first_frame' : 'reference_image';
-    body.content.push(imagePart);
+
+  // 按官方要求：first_frame 必须在 last_frame 之前；role 严格区分
+  if (firstForApi) {
+    const p = { type: 'image_url', image_url: { url: firstForApi } };
+    p.role = 'first_frame';
+    body.content.push(p);
+  }
+  if (lastForApi) {
+    const p = { type: 'image_url', image_url: { url: lastForApi } };
+    p.role = 'last_frame';
+    body.content.push(p);
   }
 
-  log.info('Video API request', {
-    url,
+  // 向后兼容：没有任何 first/last 字段时，单张 image_url 仍按老逻辑作为 first_frame（i2v）
+  if (!hasAnyFrame && image_url && image_url.trim()) {
+    // 极少数兜底（正常流程不会走到这里，因为 rawFirst 已包含 image_url）
+    const legacy = resolveVolcClassicImage(image_url, files_base_url || opts.files_base_url, storage_local_path || opts.storage_local_path, log, video_gen_id, 'image_url_fallback');
+    if (legacy) {
+      const p = { type: 'image_url', image_url: { url: legacy } };
+      p.role = 'first_frame';
+      body.content.push(p);
+      if (!body.task_type) body.task_type = 'i2v';
+    }
+  }
+
+  // Seedance 1.5 Pro（火山）480p 草稿模式：检测模型名含 seedance + 1-5 + pro 且分辨率为 480p 时自动添加 draft=true，降低成本并加速
+  if (isVolc) {
+    const m = (finalModel || '').toLowerCase();
+    const resStr = resolution ? String(resolution).toLowerCase() : '';
+    if (m.includes('seedance') && m.includes('1-5') && m.includes('pro') && resStr === '480p') {
+      body.draft = true;
+      log.info('启用 Seedance 1.5 Pro 草稿模式 (draft=true) 以降低成本并提升速度', { model: finalModel, resolution, video_gen_id });
+    }
+  }
+
+  logVideoPostRequest(log, 'Video', url, body, video_gen_id, {
     model,
-    video_gen_id,
     task_type: body.task_type,
-    request_body: JSON.stringify({ ...body, content: body.content?.map(c => c.type === 'image_url' ? { ...c, image_url: { url: '(omitted)' } } : c) }),
+    has_first_frame: !!firstForApi,
+    has_last_frame: !!lastForApi,
+    frame_count: (firstForApi ? 1 : 0) + (lastForApi ? 1 : 0),
   });
   const res = await fetch(url, {
     method: 'POST',
@@ -3049,16 +4217,17 @@ async function callVideoApi(db, log, opts) {
 }
 
 /**
- * 轮询异步视频任务（即梦 / ChatFire / 方舟 / DashScope 等）。
- * 默认约 30 分钟（每 10 秒一轮）；可由调用方传入 maxAttempts、intervalMs 覆盖。
+ * ??????????????????/ChatFire ? ???? DashScope?
  */
-async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 180, intervalMs = 10000) {
+async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 300, intervalMs = 10000) {
   const provider = (config.provider || '').toLowerCase();
   const protocol = resolveVideoProtocol(config);
   const isDashScope = protocol === 'dashscope';
   const isGemini = protocol === 'gemini';
   const isVidu = protocol === 'vidu';
   const isSora = protocol === 'sora';
+  const isAgnes = protocol === 'agnes';
+  const isMinimaxH3 = protocol === 'minimax_h3';
   const isKling = protocol === 'kling';
   const isKlingOmni = protocol === 'kling_omni' || (typeof taskId === 'string' && taskId.startsWith('omni:'));
   const isVeo3 = protocol === 'veo3';
@@ -3079,8 +4248,36 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
     log.warn('[poll] Jimeng AI API 不应进入轮询', { video_gen_id: videoGenId, task_id: taskId });
     return { error: 'Jimeng AI API 为同步返回视频地址，不应进入轮询' };
   }
-  const queryUrl = () => buildQueryUrl(config, taskId);
-  log.info('[poll] ????', { video_gen_id: videoGenId, task_id: taskId, protocol, poll_url: queryUrl() });
+  let pollTaskId = taskId;
+  /** Agnes：completed 后 remixed_from_video_id / metadata.url 偶发迟到，对齐 new-api 继续多查几轮 */
+  let agnesCompletedWithoutUrl = 0;
+  const AGNES_COMPLETED_URL_GRACE = 12;
+  let agnesPollModel = getModelFromConfig(config);
+  if (isAgnes && db && videoGenId) {
+    try {
+      const row = db.prepare('SELECT model FROM video_generations WHERE id = ?').get(Number(videoGenId));
+      if (row && row.model != null) {
+        let m = row.model;
+        if (typeof m === 'string' && m.trim().startsWith('[')) {
+          try {
+            const parsed = JSON.parse(m);
+            if (Array.isArray(parsed) && parsed[0]) m = parsed[0];
+          } catch (_) {}
+        } else if (Array.isArray(m) && m[0]) {
+          m = m[0];
+        }
+        if (String(m).trim()) agnesPollModel = String(m).trim();
+      }
+    } catch (_) {}
+  }
+  const queryUrl = () => buildQueryUrl(config, pollTaskId, { model: agnesPollModel });
+  log.info('[poll] 开始', {
+    video_gen_id: videoGenId,
+    task_id: pollTaskId,
+    protocol,
+    poll_url: queryUrl(),
+    agnes_model: isAgnes ? agnesPollModel : undefined,
+  });
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await new Promise((r) => setTimeout(r, intervalMs));
     try {
@@ -3261,6 +4458,80 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
         continue;
       }
 
+      if (isAgnes) {
+        const status = extractPollTaskStatus(data);
+        log.info('[Agnes poll] 状态', {
+          video_gen_id: videoGenId,
+          attempt,
+          status,
+          progress: data.progress,
+          id: data.id,
+          poll_id: pollTaskId,
+          poll_url: queryUrl(),
+        });
+        if (isPollTaskFailed(status)) {
+          const msg = extractPollFailureMessage(data) || 'Agnes 视频任务失败';
+          log.warn('[Agnes poll] 任务失败', { video_gen_id: videoGenId, msg, data: JSON.stringify(data).slice(0, 300) });
+          return { error: String(msg).slice(0, 500) };
+        }
+        // 对齐 new-api ParseTaskResult / ExtractVideoURLFromJSON（含 metadata.url、remixed_from_video_id）
+        const videoUrl = extractAgnesVideoUrl(data);
+        if (videoUrl && isPlausibleHttpVideoUrl(videoUrl)) {
+          log.info('[Agnes poll] 完成', { video_gen_id: videoGenId, video_url: videoUrl });
+          return { video_url: videoUrl };
+        }
+        if (status === 'succeeded' || status === 'completed' || status === 'done') {
+          agnesCompletedWithoutUrl += 1;
+          log.warn('[Agnes poll] completed 但尚未返回视频直链，继续等待', {
+            video_gen_id: videoGenId,
+            miss: agnesCompletedWithoutUrl,
+            grace: AGNES_COMPLETED_URL_GRACE,
+            data: JSON.stringify(data).slice(0, 500),
+          });
+          if (agnesCompletedWithoutUrl >= AGNES_COMPLETED_URL_GRACE) {
+            return {
+              error: 'Agnes 任务完成但未返回视频地址: ' + JSON.stringify(data).slice(0, 300),
+            };
+          }
+        }
+        continue;
+      }
+
+      if (isMinimaxH3) {
+        const status = extractMinimaxH3TaskStatus(data);
+        const videoUrl = extractMinimaxH3VideoUrl(data);
+        const taskObj = data.task && typeof data.task === 'object' ? data.task : data;
+        log.info('[MiniMaxH3 poll] 状态', {
+          video_gen_id: videoGenId,
+          attempt,
+          status,
+          has_url: !!videoUrl,
+          id: taskObj.id || taskId,
+        });
+        if (status === 'failed' || status === 'cancelled' || status === 'canceled' || status === 'error') {
+          const err = taskObj.error;
+          const msg =
+            (err && (err.message || err.code)) ||
+            extractPollFailureMessage(data) ||
+            status ||
+            'MiniMax H3 任务失败';
+          log.warn('[MiniMaxH3 poll] 任务失败', { video_gen_id: videoGenId, msg });
+          return { error: String(msg).slice(0, 500) };
+        }
+        if (videoUrl && isPlausibleHttpVideoUrl(videoUrl)) {
+          log.info('[MiniMaxH3 poll] 完成', { video_gen_id: videoGenId, video_url: videoUrl });
+          return { video_url: videoUrl };
+        }
+        if (status === 'succeeded' || status === 'completed' || status === 'success' || status === 'done') {
+          log.warn('[MiniMaxH3 poll] 成功但无视频地址', {
+            video_gen_id: videoGenId,
+            data: JSON.stringify(data).slice(0, 500),
+          });
+          return { error: 'MiniMax H3 任务完成但未返回视频地址' };
+        }
+        continue;
+      }
+
       if (isVidu) {
         const state = (data?.state || data?.status || data?.data?.status || '').toLowerCase();
         log.info('[Vidu poll] ????', { video_gen_id: videoGenId, attempt, state, id: taskId });
@@ -3350,7 +4621,7 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
       log.warn('Video poll request failed', { attempt, error: e.message });
     }
   }
-  return { error: '视频生成轮询超时' };
+  return { error: '??????' };
 }
 
 module.exports = {
@@ -3359,4 +4630,24 @@ module.exports = {
   pollVideoTask,
   normalizeAspectRatioForApi,
   isPlausibleHttpVideoUrl,
+  pickProxyVideoUrl,
+  extractAgnesVideoUrl,
+  buildAgnesPollUrl,
+  getAgnesApiRoot,
+  buildAgnesVideoImagePayload,
+  buildAgnesVideo25Body,
+  isAgnesVideo25Model,
+  isAgnesVideo25FlashModel,
+  normalizeAgnesVideo25Duration,
+  normalizeAgnesVideo25Size,
+  normalizeAgnesVideo25AspectRatio,
+  formatVideoPostBodyForLog,
+  isSeedance2FamilyModel,
+  normalizeVolcengineDuration,
+  isMinimaxH3Model,
+  getMinimaxApiRoot,
+  buildMinimaxH3PollUrl,
+  extractMinimaxH3VideoUrl,
+  normalizeMinimaxH3Duration,
+  normalizeMinimaxH3Resolution,
 };

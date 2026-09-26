@@ -2,6 +2,11 @@ const { app, BrowserWindow, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
+// 打包 exe 出站常见 IPv6 黑洞（Cloudflare ETIMEDOUT）；尽早优先 IPv4
+try {
+  require('dns').setDefaultResultOrder('ipv4first');
+} catch (_) {}
+
 // 显式固定 userData 目录，使开发模式与打包 exe 路径完全一致，防止 productName 变更导致路径漂移
 const USERDATA_DIR = path.join(app.getPath('appData'), 'localminidrama-desktop');
 app.setPath('userData', USERDATA_DIR);
@@ -47,7 +52,7 @@ let serverInstance = null;
 function getBackendModulePath() {
   if (app.isPackaged) return BACKEND_APP_PATH;
   // Electron 开发模式必须用 backend-app：require 会向上解析到 desktop/node_modules，
-  // 其中 better-sqlite3 已由 postinstall 的 electron-rebuild 对准当前 Electron ABI。
+  // 其中 better-sqlite3 已由 postinstall 的 electron-builder install-app-deps 对准当前 Electron ABI。
   // 若直接用 backend-node，则会加载 backend-node/node_modules（多为本机 Node 编的 ABI，必炸）。
   if (process.versions.electron && fs.existsSync(path.join(BACKEND_APP_PATH, 'src', 'app.js'))) {
     return BACKEND_APP_PATH;
@@ -258,6 +263,11 @@ app.whenReady().then(async () => {
     const stack = err && err.stack ? err.stack : String(err);
     writeMainLog(`Failed to start backend\n${stack}`);
     console.error('Failed to start backend', err);
+    const { dialog } = require('electron');
+    dialog.showErrorBox(
+      '本地短剧助手启动失败',
+      `后端服务未能启动，请查看日志：\n${MAIN_STARTUP_LOG}\n\n${stack}`
+    );
     app.quit();
     return;
   }
